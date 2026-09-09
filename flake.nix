@@ -26,10 +26,6 @@
       default = self.homeModules.nekors;
     };
 
-    # Kept as an alias: home-manager renamed homeManagerModules to homeModules,
-    # and flakes in the wild still reach for the old name.
-    homeManagerModules = self.homeModules;
-
     # The real development environment is devenv (see devenv.nix); this is the
     # plain-nix fallback so `nix develop` is not a dead end.
     devShells = eachSystem (system: let
