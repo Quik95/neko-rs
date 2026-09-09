@@ -66,6 +66,10 @@ impl FromStr for Colour {
 }
 
 #[derive(Debug, Parser)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "these are command line flags, not a state machine"
+)]
 #[command(
     name = "nekors",
     version,
@@ -116,6 +120,11 @@ pub struct Cli {
     #[arg(long, default_value_t = 1.0)]
     pub sleepiness: f64,
 
+    /// Sleepiness to use at night instead of --sleepiness. Night is 22:00 to
+    /// 06:00 in the local timezone; unset means the same all day.
+    #[arg(long)]
+    pub sleepiness_night: Option<f64>,
+
     /// Seconds without the cursor moving before the animal is put to sleep.
     /// 0 disables it and leaves the usual idle chain to get there.
     #[arg(long, default_value_t = 0.0)]
@@ -128,6 +137,11 @@ pub struct Cli {
     /// Keep running if the compositor closes the surface, instead of exiting.
     #[arg(long)]
     pub survive_close: bool,
+
+    /// Ignore the cursor and let the animal idle where it stands, the way
+    /// wayneko behaves without --follow-pointer.
+    #[arg(long = "static")]
+    pub is_static: bool,
 
     /// Print a shell completion script and exit.
     #[arg(long, value_enum, value_name = "SHELL")]

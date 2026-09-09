@@ -19,5 +19,6 @@ clap = { workspace = true, features = ["derive"] }
 clap_complete = "4"
 clap_mangen = "0.2"
 env_logger.workspace = true
+jiff.workspace = true
 log.workspace = true
 zbus.workspace = true

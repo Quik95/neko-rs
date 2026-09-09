@@ -68,6 +68,8 @@ fn run(args: &Cli) -> Result<()> {
     );
 
     let mut warned_about_silence = false;
+    // Starts false so the first tick applies the night value if it is night.
+    let mut night_now = false;
     loop {
         let frame_started = Instant::now();
         overlay.dispatch()?;
@@ -81,9 +83,26 @@ fn run(args: &Cli) -> Result<()> {
         }
         neko.set_bounds(brain_bounds(overlay.size(), scale));
 
-        match cursor.last_position() {
+        // Tracked as "is it night" rather than as the value, so switching back
+        // and forth is an unambiguous bool flip rather than a float compare.
+        if let Some(night_sleepiness) = args.sleepiness_night {
+            let night = is_night();
+            if night != night_now {
+                let wanted = if night {
+                    night_sleepiness
+                } else {
+                    args.sleepiness
+                };
+                log::info!("sleepiness is now {wanted}");
+                neko.set_sleepiness(wanted);
+                night_now = night;
+            }
+        }
+
+        // --static keeps the animal to itself, so the cursor is never consulted.
+        match cursor.last_position().filter(|_| !args.is_static) {
             None => {
-                if !warned_about_silence && frame_started.elapsed() > Duration::ZERO {
+                if !warned_about_silence && !args.is_static {
                     log::warn!(
                         "no cursor position yet - is the nekors KWin script loaded? \
                          try `reload-kwin-script`"
@@ -118,6 +137,15 @@ fn run(args: &Cli) -> Result<()> {
             std::thread::sleep(remaining);
         }
     }
+}
+
+/// Whether it is night where the machine is, for `--sleepiness-night`.
+///
+/// 22:00 to 06:00, matching what people usually mean by it. The timezone comes
+/// from the system, so this follows the user across a flight without asking.
+fn is_night() -> bool {
+    let hour = jiff::Zoned::now().hour();
+    !(6..22).contains(&hour)
 }
 
 /// The bounds to hand the state machine.
