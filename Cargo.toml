@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/neko-core",
+    "crates/neko-sprites",
+    "crates/neko-render",
+    "crates/nekors",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "EUPL-1.2"
+repository = "https://github.com/quik95/neko-rs"
+
+[workspace.dependencies]
+neko-core = { path = "crates/neko-core" }
+neko-sprites = { path = "crates/neko-sprites" }
+neko-render = { path = "crates/neko-render" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+wayland-protocols = "0.32"
+zbus = "5"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
