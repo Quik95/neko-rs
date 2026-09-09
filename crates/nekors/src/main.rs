@@ -63,9 +63,10 @@ fn run(args: &Cli) -> Result<()> {
     let idle_sleep = (args.idle_sleep > 0.0).then(|| Duration::from_secs_f64(args.idle_sleep));
 
     log::info!(
-        "{animal:?} on a {}x{} overlay, scale {scale}",
+        "{animal:?} on a {}x{} overlay across {} screen(s), scale {scale}",
         overlay.size().0,
         overlay.size().1,
+        overlay.screen_count(),
     );
 
     let mut warned_about_silence = false;
@@ -115,7 +116,11 @@ fn run(args: &Cli) -> Result<()> {
                 neko.tick((position.0 + SPRITE_SIZE / 2, position.1 + SPRITE_SIZE));
             }
             Some((position, age)) => {
-                neko.tick(position);
+                // The KWin script reports in the compositor's global
+                // coordinates, which start wherever the leftmost monitor does;
+                // the state machine counts from the top-left of the layout.
+                let origin = overlay.origin();
+                neko.tick((position.0 - origin.0, position.1 - origin.1));
                 // A cursor that has not moved in a long time means the user has
                 // gone away - drop straight to sleep rather than standing there
                 // washing indefinitely.
@@ -136,7 +141,7 @@ fn run(args: &Cli) -> Result<()> {
             .sprite(frame)
             .with_context(|| format!("no sprite named {frame}"))?;
         let (x, y) = neko.position();
-        overlay.draw(sprite, x, y)?;
+        overlay.draw(sprite, x, y);
 
         // oneko thinks eight times a second; keep that rate regardless of how
         // long the frame took.

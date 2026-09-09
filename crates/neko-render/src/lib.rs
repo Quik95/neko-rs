@@ -1,5 +1,5 @@
-//! The window: a fullscreen `zwlr_layer_shell_v1` overlay that never takes
-//! input.
+//! The window: one `zwlr_layer_shell_v1` overlay per output, none of which ever
+//! takes input.
 //!
 //! The interesting part is [`Overlay::new`] setting an *empty* input region.
 //! A fullscreen surface that swallowed clicks would make the desktop unusable,
@@ -7,8 +7,20 @@
 //! one edge: they need `wl_pointer` events to know where the cursor is. Here
 //! the cursor position arrives from outside over D-Bus, so the surface can give
 //! up input entirely and cover the whole screen.
+//!
+//! # Multiple monitors
+//!
+//! A layer surface covers exactly one output and is told nothing about where
+//! that output sits, but the cursor positions arriving over D-Bus are in the
+//! compositor's *global* coordinate space, which spans every monitor. So the
+//! overlay keeps one surface per output, learns each output's place in that
+//! space from `xdg_output`, and works in one coordinate system: the bounding
+//! box of the whole layout, with the origin at its top-left
+//! ([`Overlay::origin`], [`Overlay::size`]). A sprite lying across a monitor
+//! edge is drawn on both surfaces, each clipping its own half, so the animal
+//! walks from screen to screen instead of stopping at the seam.
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use neko_sprites::{Canvas, Palette, Sprite};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
@@ -65,14 +77,29 @@ struct Rect {
     height: i32,
 }
 
+impl Rect {
+    /// Whether any pixel of this rectangle lands on a surface `width` x
+    /// `height` - i.e. whether that surface has anything to redraw.
+    fn hits(self, width: i32, height: i32) -> bool {
+        self.x < width && self.y < height && self.x + self.width > 0 && self.y + self.height > 0
+    }
+}
+
+/// Identifies a surface across the protocol objects hung off it.
+///
+/// Fractional-scale and viewport objects arrive with no hint as to which of
+/// several outputs they belong to, so they carry this as their user data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScreenId(u32);
+
 /// How the overlay should be set up.
 #[derive(Debug, Clone)]
 pub struct OverlayConfig {
     /// Which layer-shell layer to sit on. `Overlay` puts the animal above
     /// everything including fullscreen windows.
     pub layer: Layer,
-    /// The `wl_output` to cover, by name (e.g. `"DP-1"`). `None` lets the
-    /// compositor pick.
+    /// The `wl_output` to confine the animal to, by name (e.g. `"DP-1"`).
+    /// `None` spans every output, so it can cross from monitor to monitor.
     pub output: Option<String>,
     /// Integer upscaling of the 32x32 sprite.
     pub scale: u32,
@@ -94,7 +121,8 @@ impl Default for OverlayConfig {
     }
 }
 
-/// A fullscreen click-through surface with one sprite drawn on it.
+/// Click-through surfaces covering every monitor, with one sprite drawn across
+/// them.
 pub struct Overlay {
     event_queue: EventQueue<State>,
     state: State,
@@ -113,44 +141,7 @@ impl Overlay {
         let layer_shell = LayerShell::bind(&globals, &qh)
             .context("compositor does not offer zwlr_layer_shell_v1")?;
         let shm = Shm::bind(&globals, &qh).context("compositor does not offer wl_shm")?;
-        let output_state = OutputState::new(&globals, &qh);
-
-        let output = match &config.output {
-            None => None,
-            Some(wanted) => Some(
-                output_state
-                    .outputs()
-                    .find(|output| {
-                        output_state
-                            .info(output)
-                            .and_then(|info| info.name)
-                            .is_some_and(|name| &name == wanted)
-                    })
-                    .with_context(|| format!("no output named {wanted}"))?,
-            ),
-        };
-
-        let surface = compositor.create_surface(&qh);
-        let layer = layer_shell.create_layer_surface(
-            &qh,
-            surface,
-            config.layer,
-            Some("nekors"),
-            output.as_ref(),
-        );
-
-        // Anchoring to all four edges asks for the whole output. The negative
-        // exclusive zone means "do not reserve space, and ignore everyone
-        // else's reserved space" - panels stay usable and we still cover them.
-        layer.set_anchor(Anchor::all());
-        layer.set_exclusive_zone(-1);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-
-        // An empty region, not a missing one: no input region at all would mean
-        // "the whole surface", which is the opposite of what we want.
-        let region = Region::new(&compositor).context("create an empty input region")?;
-        layer.set_input_region(Some(region.wl_region()));
-        layer.commit();
+        let outputs = OutputState::new(&globals, &qh);
 
         let idle_notification = config
             .idle_after
@@ -160,16 +151,12 @@ impl Overlay {
         // device resolution, which needs a viewport; without one, ask for
         // nothing and let the compositor scale a logical-sized buffer.
         let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
-        let viewport = viewporter
-            .as_ref()
-            .map(|viewporter| viewporter.get_viewport(layer.wl_surface(), &qh, ()));
-        let fractional_scale = viewport.as_ref().and(
+        let fractional_scales = viewporter.as_ref().and(
             globals
                 .bind::<WpFractionalScaleManagerV1, _, _>(&qh, 1..=1, ())
-                .ok()
-                .map(|manager| manager.get_fractional_scale(layer.wl_surface(), &qh, ())),
+                .ok(),
         );
-        if viewport.is_none() {
+        if viewporter.is_none() {
             log::info!("no wp_viewporter; the compositor will scale the overlay itself");
         }
 
@@ -177,27 +164,49 @@ impl Overlay {
         let state = State {
             _idle_notification: idle_notification,
             session_idle: false,
-            viewport,
-            _fractional_scale: fractional_scale,
-            scale_120: SCALE_DENOMINATOR,
+            viewporter,
+            fractional_scales,
             registry: RegistryState::new(&globals),
-            outputs: output_state,
+            qh: qh.clone(),
+            compositor,
+            layer_shell,
+            outputs,
             shm,
             pool,
             config,
-            layer,
-            size: (0, 0),
-            slots: [Slot::EMPTY, Slot::EMPTY],
-            next_slot: 0,
-            configured: false,
+            screens: Vec::new(),
+            next_id: 0,
             closed: false,
         };
 
         let mut overlay = Self { event_queue, state };
 
-        // The surface is not usable until the compositor has told us how big it
-        // is, which it does in response to the commit above.
-        while !overlay.state.configured && !overlay.state.closed {
+        // Registry initialisation announces the outputs but not their names or
+        // their places in the layout: those arrive as wl_output and xdg_output
+        // events on the next round. Building surfaces before they land would
+        // stack every monitor at the origin and lose the layout entirely.
+        overlay
+            .event_queue
+            .roundtrip(&mut overlay.state)
+            .context("waiting for the output layout")?;
+
+        // The outputs the compositor has now; anything plugged in later arrives
+        // through OutputHandler::new_output.
+        let known: Vec<_> = overlay.state.outputs.outputs().collect();
+        for output in &known {
+            overlay.state.add_screen(output);
+        }
+        if overlay.state.screens.is_empty() {
+            match &overlay.state.config.output {
+                Some(wanted) => bail!("no output named {wanted}"),
+                None => bail!("the compositor reports no outputs"),
+            }
+        }
+
+        // A surface is not usable until the compositor has told us how big it
+        // is, which it does in response to the commits above. One is enough to
+        // start drawing; the others join as they are configured.
+        while !overlay.state.any_configured() && !overlay.state.closed {
             overlay
                 .event_queue
                 .blocking_dispatch(&mut overlay.state)
@@ -206,14 +215,26 @@ impl Overlay {
         Ok(overlay)
     }
 
-    /// The surface size in logical pixels, which is the coordinate space the
-    /// cursor positions and the state machine both work in.
+    /// The top-left of the monitor layout in the compositor's global logical
+    /// coordinates - the space cursor positions arrive in.
+    ///
+    /// Subtract it from a global cursor position to get a coordinate in the
+    /// space [`Overlay::size`] and [`Overlay::draw`] work in.
     #[must_use]
-    pub fn size(&self) -> (i32, i32) {
-        self.state.size
+    pub fn origin(&self) -> (i32, i32) {
+        let (x, y, _, _) = self.state.bounds();
+        (x, y)
     }
 
-    /// True once the compositor has taken the surface away.
+    /// The size of the whole monitor layout in logical pixels, which is the
+    /// coordinate space the state machine works in.
+    #[must_use]
+    pub fn size(&self) -> (i32, i32) {
+        let (_, _, width, height) = self.state.bounds();
+        (width, height)
+    }
+
+    /// True once the compositor has taken every surface away.
     #[must_use]
     pub fn closed(&self) -> bool {
         self.state.closed
@@ -227,6 +248,12 @@ impl Overlay {
         self.state.session_idle
     }
 
+    /// How many outputs the animal is currently spread across.
+    #[must_use]
+    pub fn screen_count(&self) -> usize {
+        self.state.screens.len()
+    }
+
     /// Handles pending Wayland events - configures, output changes, closes.
     pub fn dispatch(&mut self) -> Result<()> {
         self.event_queue
@@ -235,30 +262,18 @@ impl Overlay {
         Ok(())
     }
 
-    /// Draws `sprite` with its top-left at `(x, y)` in logical pixels.
-    pub fn draw(&mut self, sprite: &Sprite, x: i32, y: i32) -> Result<()> {
-        self.state.draw(sprite, x, y)
+    /// Draws `sprite` with its top-left at `(x, y)`, in logical pixels relative
+    /// to [`Overlay::origin`].
+    pub fn draw(&mut self, sprite: &Sprite, x: i32, y: i32) {
+        self.state.draw(sprite, x, y);
     }
 }
 
-struct State {
-    registry: RegistryState,
-    outputs: OutputState,
-    shm: Shm,
-    pool: SlotPool,
-    config: OverlayConfig,
+/// One output: its surface, its buffers, and where it sits in the layout.
+struct Screen {
+    id: ScreenId,
+    output: wl_output::WlOutput,
     layer: LayerSurface,
-    /// Surface size in logical pixels.
-    size: (i32, i32),
-    /// Two buffers, alternated. A single one would never come back: the
-    /// compositor holds an attached buffer until another is attached, so we
-    /// would be waiting for a release that only our own next frame can cause.
-    slots: [Slot; 2],
-    /// Which slot to prefer next frame - the one not currently on screen.
-    next_slot: usize,
-    /// Held so the compositor keeps sending idle events; never read.
-    _idle_notification: Option<ExtIdleNotificationV1>,
-    session_idle: bool,
     /// Scales the buffer down to the logical size the surface was given, so we
     /// can hand over real device pixels. `None` on a compositor without
     /// `wp_viewporter`, where the buffer has to be logical-sized.
@@ -267,11 +282,20 @@ struct State {
     _fractional_scale: Option<WpFractionalScaleV1>,
     /// The compositor's preferred scale, in 120ths. 120 means 1.0.
     scale_120: u32,
+    /// Where this output's top-left sits in the global logical layout.
+    position: (i32, i32),
+    /// Surface size in logical pixels.
+    size: (i32, i32),
+    /// Two buffers, alternated. A single one would never come back: the
+    /// compositor holds an attached buffer until another is attached, so we
+    /// would be waiting for a release that only our own next frame can cause.
+    slots: [Slot; 2],
+    /// Which slot to prefer next frame - the one not currently on screen.
+    next_slot: usize,
     configured: bool,
-    closed: bool,
 }
 
-impl State {
+impl Screen {
     /// The compositor's preferred scale as a plain number.
     fn scale_factor(&self) -> f64 {
         f64::from(self.scale_120) / f64::from(SCALE_DENOMINATOR)
@@ -306,15 +330,14 @@ impl State {
     }
 
     /// (Re)allocates the shm buffers after a resize.
-    fn ensure_buffers(&mut self) -> Result<()> {
+    fn ensure_buffers(&mut self, pool: &mut SlotPool) -> Result<()> {
         let (width, height) = self.device_size();
         let stride = width * 4;
         for slot in &mut self.slots {
             if slot.buffer.is_some() {
                 continue;
             }
-            let (buffer, canvas) = self
-                .pool
+            let (buffer, canvas) = pool
                 .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
                 .context("allocate the shm buffer")?;
             // A fresh slot may hold whatever the last one did; start transparent.
@@ -325,19 +348,31 @@ impl State {
         Ok(())
     }
 
-    fn draw(&mut self, sprite: &Sprite, x: i32, y: i32) -> Result<()> {
+    /// Draws the sprite at `(x, y)` in this output's own logical pixels.
+    ///
+    /// The caller has already translated out of the layout-wide space, so an
+    /// animal standing on another monitor simply lands outside this surface and
+    /// is clipped away - and one straddling the edge is drawn half here.
+    fn draw(
+        &mut self,
+        pool: &mut SlotPool,
+        config: &OverlayConfig,
+        sprite: &Sprite,
+        x: i32,
+        y: i32,
+    ) -> Result<()> {
         if !self.configured || self.size.0 <= 0 || self.size.1 <= 0 {
             return Ok(());
         }
-        self.ensure_buffers()?;
-        let (device_width, _) = self.device_size();
+        self.ensure_buffers(pool)?;
+        let (device_width, device_height) = self.device_size();
         let stride = usize::try_from(device_width).expect("non-negative width");
 
         // Everything below works in device pixels. The sprite is upscaled by a
         // whole number even so - a 1-bit bitmap resampled by 1.25 turns to mush,
         // so the animal ends up a few percent off its requested size instead.
         let factor = self.scale_factor();
-        let pixel_scale = u32::try_from(round(f64::from(self.config.scale) * factor))
+        let pixel_scale = u32::try_from(round(f64::from(config.scale) * factor))
             .unwrap_or(1)
             .max(1);
         let scale = i32::try_from(pixel_scale).unwrap_or(1);
@@ -354,6 +389,20 @@ impl State {
             height: i32::try_from(sprite.height).expect("sprite fits") * scale,
         };
 
+        // With several monitors most of them have nothing to do on most frames:
+        // the animal is elsewhere and was elsewhere last frame too. Committing
+        // anyway would wake the compositor for every screen eight times a
+        // second to change nothing.
+        let touched = target.hits(device_width, device_height)
+            || self
+                .slots
+                .iter()
+                .filter_map(|slot| slot.last_drawn)
+                .any(|rect| rect.hits(device_width, device_height));
+        if !touched {
+            return Ok(());
+        }
+
         // Taken out so the buffer and the pool can be borrowed at once; put
         // back before returning. The preferred slot is the one not on screen,
         // but either will do if that one has not been released yet.
@@ -362,7 +411,7 @@ impl State {
             let Some(buffer) = self.slots[index].buffer.take() else {
                 continue;
             };
-            if buffer.canvas(&mut self.pool).is_some() {
+            if buffer.canvas(pool).is_some() {
                 free = Some((index, buffer));
                 break;
             }
@@ -375,7 +424,7 @@ impl State {
             return Ok(());
         };
         self.next_slot = 1 - index;
-        let canvas = buffer.canvas(&mut self.pool).expect("just checked");
+        let canvas = buffer.canvas(pool).expect("just checked");
         // The pool hands out bytes; the format is Argb8888, so they are pixels.
         let pixels: &mut [u32] = bytemuck::cast_slice_mut(canvas);
 
@@ -392,7 +441,7 @@ impl State {
             clear(pixels, stride, previous);
         }
         let mut canvas = Canvas { pixels, stride };
-        sprite.blit_argb(&mut canvas, x, y, pixel_scale, self.config.palette);
+        sprite.blit_argb(&mut canvas, x, y, pixel_scale, config.palette);
 
         let surface = self.layer.wl_surface();
         for rect in stale_rects.into_iter().flatten().chain([target]) {
@@ -406,6 +455,178 @@ impl State {
         self.layer.commit();
         self.slots[index].buffer = Some(buffer);
         Ok(())
+    }
+}
+
+struct State {
+    registry: RegistryState,
+    qh: QueueHandle<State>,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
+    outputs: OutputState,
+    shm: Shm,
+    /// One pool behind every surface: the buffers are small and the pool grows
+    /// to fit, so there is nothing to gain from one each.
+    pool: SlotPool,
+    config: OverlayConfig,
+    viewporter: Option<WpViewporter>,
+    fractional_scales: Option<WpFractionalScaleManagerV1>,
+    screens: Vec<Screen>,
+    next_id: u32,
+    /// Held so the compositor keeps sending idle events; never read.
+    _idle_notification: Option<ExtIdleNotificationV1>,
+    session_idle: bool,
+    closed: bool,
+}
+
+impl State {
+    /// Whether the animal belongs on this output.
+    fn wanted(&self, output: &wl_output::WlOutput) -> bool {
+        let Some(wanted) = &self.config.output else {
+            return true;
+        };
+        self.outputs
+            .info(output)
+            .and_then(|info| info.name)
+            .is_some_and(|name| &name == wanted)
+    }
+
+    /// Where the compositor puts this output in the global layout, as
+    /// `xdg_output` reports it. An output without one is placed at the origin,
+    /// which is right for a single monitor and the best guess otherwise.
+    fn position_of(&self, output: &wl_output::WlOutput) -> (i32, i32) {
+        self.outputs
+            .info(output)
+            .and_then(|info| info.logical_position)
+            .unwrap_or((0, 0))
+    }
+
+    /// Builds a surface for an output, unless `--output` rules it out or it
+    /// already has one.
+    fn add_screen(&mut self, output: &wl_output::WlOutput) {
+        if !self.wanted(output) || self.screens.iter().any(|screen| &screen.output == output) {
+            return;
+        }
+
+        let id = ScreenId(self.next_id);
+        self.next_id += 1;
+
+        let surface = self.compositor.create_surface(&self.qh);
+        let layer = self.layer_shell.create_layer_surface(
+            &self.qh,
+            surface,
+            self.config.layer,
+            Some("nekors"),
+            Some(output),
+        );
+
+        // Anchoring to all four edges asks for the whole output. The negative
+        // exclusive zone means "do not reserve space, and ignore everyone
+        // else's reserved space" - panels stay usable and we still cover them.
+        layer.set_anchor(Anchor::all());
+        layer.set_exclusive_zone(-1);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+
+        // An empty region, not a missing one: no input region at all would mean
+        // "the whole surface", which is the opposite of what we want.
+        match Region::new(&self.compositor) {
+            Ok(region) => layer.set_input_region(Some(region.wl_region())),
+            Err(error) => log::error!("no input region ({error}); the overlay will eat clicks"),
+        }
+        layer.commit();
+
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|viewporter| viewporter.get_viewport(layer.wl_surface(), &self.qh, id));
+        let fractional_scale = viewport.as_ref().and(
+            self.fractional_scales
+                .as_ref()
+                .map(|manager| manager.get_fractional_scale(layer.wl_surface(), &self.qh, id)),
+        );
+
+        let name = self
+            .outputs
+            .info(output)
+            .and_then(|info| info.name)
+            .unwrap_or_else(|| "?".to_owned());
+        let position = self.position_of(output);
+        log::info!(
+            "covering output {name} at {},{} as screen {}",
+            position.0,
+            position.1,
+            id.0
+        );
+
+        self.screens.push(Screen {
+            id,
+            output: output.clone(),
+            layer,
+            viewport,
+            _fractional_scale: fractional_scale,
+            scale_120: SCALE_DENOMINATOR,
+            position,
+            size: (0, 0),
+            slots: [Slot::EMPTY, Slot::EMPTY],
+            next_slot: 0,
+            configured: false,
+        });
+    }
+
+    fn screen_mut(&mut self, id: ScreenId) -> Option<&mut Screen> {
+        self.screens.iter_mut().find(|screen| screen.id == id)
+    }
+
+    fn any_configured(&self) -> bool {
+        self.screens.iter().any(|screen| screen.configured)
+    }
+
+    /// The bounding box of every configured output, in global logical pixels:
+    /// `(x, y, width, height)`.
+    ///
+    /// A layout with a hole in it - two monitors of different heights, say -
+    /// leaves the animal able to walk into space no output covers, where it is
+    /// simply not drawn. That beats the alternative of it being unable to
+    /// cross at all.
+    fn bounds(&self) -> (i32, i32, i32, i32) {
+        let mut bounds: Option<(i32, i32, i32, i32)> = None;
+        for screen in self.screens.iter().filter(|screen| screen.configured) {
+            let (left, top) = screen.position;
+            let (right, bottom) = (left + screen.size.0, top + screen.size.1);
+            bounds = Some(match bounds {
+                None => (left, top, right, bottom),
+                Some((x, y, r, b)) => (x.min(left), y.min(top), r.max(right), b.max(bottom)),
+            });
+        }
+        let (x, y, right, bottom) = bounds.unwrap_or((0, 0, 0, 0));
+        (x, y, right - x, bottom - y)
+    }
+
+    /// Never fails as a whole: a screen that cannot be drawn on says so in the
+    /// log and the others carry on.
+    fn draw(&mut self, sprite: &Sprite, x: i32, y: i32) {
+        let (origin_x, origin_y, _, _) = self.bounds();
+        // Out of the layout-wide space the state machine thinks in and into the
+        // compositor's, which is where the outputs are placed.
+        let (global_x, global_y) = (origin_x + x, origin_y + y);
+
+        // By index, so the pool can be borrowed alongside one screen at a time.
+        for index in 0..self.screens.len() {
+            let (position, id) = {
+                let screen = &self.screens[index];
+                (screen.position, screen.id)
+            };
+            let (local_x, local_y) = (global_x - position.0, global_y - position.1);
+            let Some(screen) = self.screens.get_mut(index) else {
+                continue;
+            };
+            // One screen failing - a buffer that could not be allocated, say -
+            // is no reason to take the animal off the others.
+            if let Err(error) = screen.draw(&mut self.pool, &self.config, sprite, local_x, local_y)
+            {
+                log::warn!("drawing on screen {}: {error:#}", id.0);
+            }
+        }
     }
 }
 
@@ -440,28 +661,34 @@ fn bind_idle_notification(
     Some(notifier.get_idle_notification(millis, &seat, qh, ()))
 }
 
-impl Dispatch<WpFractionalScaleV1, ()> for State {
+impl Dispatch<WpFractionalScaleV1, ScreenId> for State {
     fn event(
         state: &mut Self,
         _proxy: &WpFractionalScaleV1,
         event: wp_fractional_scale_v1::Event,
-        (): &(),
+        id: &ScreenId,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
-            && scale != state.scale_120
-        {
-            log::info!(
-                "preferred scale is now {:.3}",
-                f64::from(scale) / f64::from(SCALE_DENOMINATOR)
-            );
-            state.scale_120 = scale;
-            // The buffers are sized in device pixels, so they are the wrong
-            // size now.
-            state.slots = [Slot::EMPTY, Slot::EMPTY];
-            state.update_viewport();
+        let wp_fractional_scale_v1::Event::PreferredScale { scale } = event else {
+            return;
+        };
+        let Some(screen) = state.screen_mut(*id) else {
+            return;
+        };
+        if scale == screen.scale_120 {
+            return;
         }
+        log::info!(
+            "preferred scale on screen {} is now {:.3}",
+            id.0,
+            f64::from(scale) / f64::from(SCALE_DENOMINATOR)
+        );
+        screen.scale_120 = scale;
+        // The buffers are sized in device pixels, so they are the wrong size
+        // now.
+        screen.slots = [Slot::EMPTY, Slot::EMPTY];
+        screen.update_viewport();
     }
 }
 
@@ -478,12 +705,12 @@ impl Dispatch<WpViewporter, ()> for State {
     }
 }
 
-impl Dispatch<WpViewport, ()> for State {
+impl Dispatch<WpViewport, ScreenId> for State {
     fn event(
         _state: &mut Self,
         _proxy: &WpViewport,
         _event: wp_viewport::Event,
-        (): &(),
+        _id: &ScreenId,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
@@ -587,15 +814,21 @@ fn clear(pixels: &mut [u32], stride: usize, rect: Rect) {
 }
 
 impl LayerShellHandler for State {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
-        self.closed = true;
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        // One monitor going away is not the end: the animal keeps to the
+        // others. Only losing the last surface leaves nothing to do.
+        self.screens
+            .retain(|screen| screen.layer.wl_surface() != layer.wl_surface());
+        if self.screens.is_empty() {
+            self.closed = true;
+        }
     }
 
     fn configure(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
+        layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
@@ -603,14 +836,21 @@ impl LayerShellHandler for State {
             i32::try_from(configure.new_size.0).unwrap_or(i32::MAX),
             i32::try_from(configure.new_size.1).unwrap_or(i32::MAX),
         );
-        if size != self.size {
-            log::info!("layer surface configured at {}x{}", size.0, size.1);
-            self.size = size;
+        let Some(screen) = self
+            .screens
+            .iter_mut()
+            .find(|screen| screen.layer.wl_surface() == layer.wl_surface())
+        else {
+            return;
+        };
+        if size != screen.size {
+            log::info!("screen {} configured at {}x{}", screen.id.0, size.0, size.1);
+            screen.size = size;
             // The old buffers are the wrong size now.
-            self.slots = [Slot::EMPTY, Slot::EMPTY];
-            self.update_viewport();
+            screen.slots = [Slot::EMPTY, Slot::EMPTY];
+            screen.update_viewport();
         }
-        self.configured = true;
+        screen.configured = true;
     }
 }
 
@@ -666,9 +906,51 @@ impl OutputHandler for State {
         &mut self.outputs
     }
 
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        self.add_screen(&output);
+    }
+
+    /// Monitors get rearranged - a laptop docked to the left of an external
+    /// screen one day and to the right the next - so the layout is re-read
+    /// rather than trusted from startup.
+    fn update_output(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        // An output whose name only turned up now may be the one --output asks
+        // for, and one that was disabled at startup comes back this way too.
+        self.add_screen(&output);
+
+        let position = self.position_of(&output);
+        if let Some(screen) = self
+            .screens
+            .iter_mut()
+            .find(|screen| screen.output == output)
+            && screen.position != position
+        {
+            log::info!(
+                "screen {} moved to {},{}",
+                screen.id.0,
+                position.0,
+                position.1
+            );
+            screen.position = position;
+        }
+    }
+
+    fn output_destroyed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        self.screens.retain(|screen| screen.output != output);
+        if self.screens.is_empty() {
+            self.closed = true;
+        }
+    }
 }
 
 impl ShmHandler for State {
