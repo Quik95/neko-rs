@@ -7,3 +7,12 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+neko-sprites.workspace = true
+
+anyhow.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+smithay-client-toolkit.workspace = true
+wayland-client.workspace = true
