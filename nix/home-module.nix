@@ -1,4 +1,4 @@
-self: {
+{
   config,
   lib,
   pkgs,
@@ -16,9 +16,16 @@ in {
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.nekors;
-      defaultText = lib.literalExpression "inputs.neko-rs.packages.\${system}.nekors";
-      description = "The nekors package to run.";
+      default = pkgs.callPackage ./package.nix {};
+      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix {}";
+      description = ''
+        The nekors package to run.
+
+        Built from the sources next to this file, so the module works however
+        it was pulled in - as a flake input, by path, or from a fetched
+        tarball. Set it to `inputs.neko-rs.packages.''${system}.nekors` to share
+        the flake's build instead.
+      '';
     };
 
     extraArgs = lib.mkOption {
