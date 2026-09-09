@@ -753,6 +753,7 @@ dependencies = [
  "neko-sprites",
  "smithay-client-toolkit",
  "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]
