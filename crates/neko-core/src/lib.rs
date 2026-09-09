@@ -206,6 +206,13 @@ impl Neko {
         self.clamp_into_bounds();
     }
 
+    /// Retunes how fast the idle timers run, for callers that vary it over the
+    /// day. Timers already counting are left alone: they are compared against
+    /// the timeout every tick, so the new value takes effect immediately.
+    pub fn set_sleepiness(&mut self, sleepiness: f64) {
+        self.config.sleepiness = sleepiness;
+    }
+
     /// Drops the animal straight into `Sleep` - used when the compositor says
     /// the session went idle, or when cursor updates dry up.
     pub fn sleep_now(&mut self) {
