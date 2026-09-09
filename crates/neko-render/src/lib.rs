@@ -131,8 +131,8 @@ impl Overlay {
             config,
             layer,
             size: (0, 0),
-            buffer: None,
-            last_drawn: None,
+            slots: [Slot::EMPTY, Slot::EMPTY],
+            next_slot: 0,
             configured: false,
             closed: false,
         };
@@ -186,30 +186,34 @@ struct State {
     layer: LayerSurface,
     /// Surface size in logical pixels.
     size: (i32, i32),
-    /// Reused across frames so undamaged pixels survive; reallocated on resize.
-    buffer: Option<Buffer>,
-    /// Where the sprite went last frame, so it can be erased.
-    last_drawn: Option<Rect>,
+    /// Two buffers, alternated. A single one would never come back: the
+    /// compositor holds an attached buffer until another is attached, so we
+    /// would be waiting for a release that only our own next frame can cause.
+    slots: [Slot; 2],
+    /// Which slot to prefer next frame - the one not currently on screen.
+    next_slot: usize,
     configured: bool,
     closed: bool,
 }
 
 impl State {
-    /// (Re)allocates the shm buffer after a resize.
-    fn ensure_buffer(&mut self) -> Result<()> {
-        if self.buffer.is_some() {
-            return Ok(());
-        }
+    /// (Re)allocates the shm buffers after a resize.
+    fn ensure_buffers(&mut self) -> Result<()> {
         let (width, height) = self.size;
         let stride = width * 4;
-        let (buffer, canvas) = self
-            .pool
-            .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
-            .context("allocate the shm buffer")?;
-        // A fresh slot may hold whatever the last one did; start transparent.
-        canvas.fill(0);
-        self.buffer = Some(buffer);
-        self.last_drawn = None;
+        for slot in &mut self.slots {
+            if slot.buffer.is_some() {
+                continue;
+            }
+            let (buffer, canvas) = self
+                .pool
+                .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+                .context("allocate the shm buffer")?;
+            // A fresh slot may hold whatever the last one did; start transparent.
+            canvas.fill(0);
+            slot.buffer = Some(buffer);
+            slot.last_drawn = None;
+        }
         Ok(())
     }
 
@@ -217,7 +221,7 @@ impl State {
         if !self.configured || self.size.0 <= 0 || self.size.1 <= 0 {
             return Ok(());
         }
-        self.ensure_buffer()?;
+        self.ensure_buffers()?;
         let stride = usize::try_from(self.size.0).expect("non-negative width");
         let scale = i32::try_from(self.config.scale).unwrap_or(1);
 
@@ -229,40 +233,71 @@ impl State {
         };
 
         // Taken out so the buffer and the pool can be borrowed at once; put
-        // back before returning.
-        let buffer = self.buffer.take().expect("just ensured");
-        let Some(canvas) = buffer.canvas(&mut self.pool) else {
-            // Every buffer is still held by the compositor; skip this frame
+        // back before returning. The preferred slot is the one not on screen,
+        // but either will do if that one has not been released yet.
+        let mut free = None;
+        for index in [self.next_slot, 1 - self.next_slot] {
+            let Some(buffer) = self.slots[index].buffer.take() else {
+                continue;
+            };
+            if buffer.canvas(&mut self.pool).is_some() {
+                free = Some((index, buffer));
+                break;
+            }
+            self.slots[index].buffer = Some(buffer);
+        }
+        let Some((index, buffer)) = free else {
+            // Both buffers are still held by the compositor; skip this frame
             // rather than tearing what is on screen.
-            log::debug!("shm buffer still in use, skipping a frame");
-            self.buffer = Some(buffer);
+            log::debug!("both shm buffers still in use, skipping a frame");
             return Ok(());
         };
+        self.next_slot = 1 - index;
+        let canvas = buffer.canvas(&mut self.pool).expect("just checked");
         // The pool hands out bytes; the format is Argb8888, so they are pixels.
         let pixels: &mut [u32] = bytemuck::cast_slice_mut(canvas);
 
         // Only two rectangles ever change: where the sprite was and where it is
         // going. Repainting a 4K screen eight times a second to move 32 pixels
         // would be silly.
-        if let Some(previous) = self.last_drawn {
+        // This buffer still holds what it showed two frames ago, so both stale
+        // rectangles have to go: its own, and the one the visible buffer shows.
+        let stale_rects = [
+            self.slots[index].last_drawn,
+            self.slots[1 - index].last_drawn,
+        ];
+        for previous in stale_rects.into_iter().flatten() {
             clear(pixels, stride, previous);
         }
         let mut canvas = Canvas { pixels, stride };
         sprite.blit_argb(&mut canvas, x, y, self.config.scale, self.config.palette);
 
         let surface = self.layer.wl_surface();
-        for rect in self.last_drawn.into_iter().chain([target]) {
+        for rect in stale_rects.into_iter().flatten().chain([target]) {
             surface.damage_buffer(rect.x, rect.y, rect.width, rect.height);
         }
-        self.last_drawn = Some(target);
+        self.slots[index].last_drawn = Some(target);
 
         buffer
             .attach_to(surface)
             .context("attach the buffer to the surface")?;
         self.layer.commit();
-        self.buffer = Some(buffer);
+        self.slots[index].buffer = Some(buffer);
         Ok(())
     }
+}
+
+/// One of the two buffers, and where the sprite went on it.
+struct Slot {
+    buffer: Option<Buffer>,
+    last_drawn: Option<Rect>,
+}
+
+impl Slot {
+    const EMPTY: Self = Self {
+        buffer: None,
+        last_drawn: None,
+    };
 }
 
 fn clear(pixels: &mut [u32], stride: usize, rect: Rect) {
@@ -304,8 +339,8 @@ impl LayerShellHandler for State {
         if size != self.size {
             log::info!("layer surface configured at {}x{}", size.0, size.1);
             self.size = size;
-            // The old buffer is the wrong size now.
-            self.buffer = None;
+            // The old buffers are the wrong size now.
+            self.slots = [Slot::EMPTY, Slot::EMPTY];
         }
         self.configured = true;
     }
