@@ -85,6 +85,25 @@ The module installs the package, links the KWin script into
 `~/.local/share/kwin/scripts/nekors` and runs nekors as a user service bound to
 `graphical-session.target`.
 
+The module is a plain Home Manager module, not a function of `self`, so it can
+also be pulled in without flakes — it builds the package from the sources it
+sits in:
+
+```nix
+let
+  neko-rs = builtins.fetchTarball {
+    url = "https://github.com/quik95/neko-rs/archive/<rev>.tar.gz";
+    sha256 = "sha256-...";
+  };
+in {
+  imports = ["${neko-rs}/nix/home-module.nix"];
+}
+```
+
+Use `builtins.fetchTarball` rather than `pkgs.fetchFromGitHub`: `pkgs` is part
+of the evaluated configuration, and reaching for it from `imports` is a
+recursion.
+
 Switching the script on in kwinrc is left to you, because kwinrc is a
 whole-file target in Home Manager and the module would fight whatever else
 manages it:

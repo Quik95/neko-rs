@@ -21,8 +21,11 @@
       default = nekors;
     });
 
+    # A plain module rather than one closing over `self`, so it can also be
+    # imported straight from a checkout or a fetched tarball; it builds the
+    # package from the sources beside it.
     homeModules = {
-      nekors = import ./nix/home-module.nix self;
+      nekors = import ./nix/home-module.nix;
       default = self.homeModules.nekors;
     };
 
