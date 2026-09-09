@@ -70,9 +70,22 @@ The flake ships the package and a Home Manager module:
 ```
 
 The module installs the package, links the KWin script into
-`~/.local/share/kwin/scripts/nekors`, writes the kwinrc entry that enables it,
-and runs nekors as a user service bound to `graphical-session.target`. KWin
-reads kwinrc at startup, so the first activation needs a relog.
+`~/.local/share/kwin/scripts/nekors` and runs nekors as a user service bound to
+`graphical-session.target`.
+
+Switching the script on in kwinrc is left to you, because kwinrc is a
+whole-file target in Home Manager and the module would fight whatever else
+manages it:
+
+```nix
+# with plasma-manager
+programs.plasma.configFile.kwinrc.Plugins.nekorsEnabled = true;
+
+# or, once:
+kwriteconfig6 --file kwinrc --group Plugins --key nekorsEnabled true
+```
+
+KWin reads kwinrc at startup, so the first activation needs a relog.
 
 ## Flags worth knowing
 
