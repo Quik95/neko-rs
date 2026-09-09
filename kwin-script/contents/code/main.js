@@ -22,7 +22,7 @@ let lastY = null;
 
 const timer = new QTimer();
 timer.interval = INTERVAL_MS;
-timer.triggered.connect(function () {
+timer.timeout.connect(function () {
     const pos = workspace.cursorPos;
     const x = Math.round(pos.x);
     const y = Math.round(pos.y);
