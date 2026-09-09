@@ -27,6 +27,18 @@ KWin  --(KWin script, ~30 Hz, callDBus)-->  org.nekors.Cursor.SetPos(x, y)
                                        nekors: FSM -> layer-shell overlay
 ```
 
+## Multiple monitors
+
+A layer surface covers one output and is never told where that output sits,
+while the cursor positions coming over D-Bus are in KWin's global coordinates
+spanning every screen. So nekors opens one surface per output, reads the layout
+from `xdg_output`, and runs the state machine in the bounding box of the whole
+arrangement — the animal walks off one monitor and onto the next, drawn on both
+surfaces while it straddles the seam. Monitors plugged in, unplugged, or
+rearranged mid-session are picked up as they happen.
+
+Pass `--output eDP-1` to keep it to a single screen.
+
 ## Layout
 
 | Crate | Role |
@@ -100,6 +112,7 @@ Full list in `nekors --help` and `nekors(1)`; the less obvious ones:
 | `--sleepiness-night N` | Overrides `--sleepiness` between 22:00 and 06:00. |
 | `--idle-notify SECS` | Sleeps once the seat is idle for this long (`ext_idle_notify_v1`). |
 | `--type NAME` | oneko's alternative animals. |
+| `--output NAME` | Confines it to one monitor instead of all of them. |
 
 Under a fractional scale the overlay draws at device resolution through
 `wp_viewporter`, so the sprite stays sharp rather than being scaled up by the

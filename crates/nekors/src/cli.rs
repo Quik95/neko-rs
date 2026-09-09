@@ -103,8 +103,8 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "overlay")]
     pub layer: LayerArg,
 
-    /// Output to run on, by name (e.g. DP-1). Defaults to the compositor's
-    /// choice.
+    /// Keep to one output, by name (e.g. DP-1). By default the animal roams
+    /// every monitor and can walk from one to the next.
     #[arg(long)]
     pub output: Option<String>,
 
