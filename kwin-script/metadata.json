@@ -6,9 +6,9 @@
         "Icon": "input-mouse",
         "License": "EUPL-1.2",
         "Version": "0.1.0",
-        "EnabledByDefault": false,
-        "ServiceTypes": ["KWin/Script"]
+        "EnabledByDefault": false
     },
+    "KPackageStructure": "KWin/Script",
     "X-Plasma-API": "javascript",
     "X-Plasma-MainScript": "code/main.js"
 }

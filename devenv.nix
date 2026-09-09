@@ -13,7 +13,7 @@
     libxkbcommon
     libxkbcommon.dev
     jq
-    kdePackages.kdbusaddons # qdbus for poking KWin's /Scripting
+    kdePackages.qttools # qdbus, for poking KWin's /Scripting
   ];
 
   env.RUST_LOG = "nekors=info";
@@ -30,11 +30,23 @@
   scripts.reload-kwin-script.exec = ''
     set -eu
     install-kwin-script
-    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript nekors || true
-    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript \
-      "$HOME/.local/share/kwin/scripts/nekors/contents/code/main.js" nekors
-    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.start
-    echo "reloaded"
+    state="''${XDG_RUNTIME_DIR:-/tmp}/nekors-kwin-script"
+
+    # KWin keeps a registration under the plugin name even when the script
+    # failed to evaluate, and a later loadScript under that name is then a
+    # no-op. Loading under a fresh name every time sidesteps it; the previous
+    # name is remembered so it can be unloaded first.
+    if [ -f "$state" ]; then
+      qdbus org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$(cat "$state")" >/dev/null || true
+    fi
+    qdbus org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript nekors >/dev/null || true
+
+    name="nekors-$(date +%s)"
+    qdbus org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript \
+      "$HOME/.local/share/kwin/scripts/nekors/contents/code/main.js" "$name" >/dev/null
+    qdbus org.kde.KWin /Scripting org.kde.kwin.Scripting.start
+    printf %s "$name" > "$state"
+    echo "loaded as $name"
   '';
 
   git-hooks.hooks = {
