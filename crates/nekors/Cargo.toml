@@ -4,6 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "An oneko clone that chases the cursor across a Wayland desktop"
 
 [lints]
 workspace = true
+
+[dependencies]
+neko-core.workspace = true
+neko-render.workspace = true
+neko-sprites.workspace = true
+
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+env_logger.workspace = true
+log.workspace = true
+zbus.workspace = true
