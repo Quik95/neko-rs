@@ -33,6 +33,29 @@ use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::{
     self, ExtIdleNotifierV1,
 };
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::{
+    self, WpFractionalScaleManagerV1,
+};
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::{
+    self, WpFractionalScaleV1,
+};
+use wayland_protocols::wp::viewporter::client::wp_viewport::{self, WpViewport};
+use wayland_protocols::wp::viewporter::client::wp_viewporter::{self, WpViewporter};
+
+/// The unit `wp_fractional_scale_v1` reports in: 120ths of a scale factor.
+const SCALE_DENOMINATOR: u32 = 120;
+
+/// Rounds a scaled pixel count back to a whole pixel.
+///
+/// Screen coordinates are a few thousand at the outside and scale factors are
+/// small, so nothing here comes close to overflowing.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "screen coordinates are far inside i32"
+)]
+fn round(value: f64) -> i32 {
+    value.round() as i32
+}
 
 pub use smithay_client_toolkit::shell::wlr_layer::Layer;
 
@@ -136,10 +159,30 @@ impl Overlay {
             .idle_after
             .and_then(|after| bind_idle_notification(&globals, &qh, after));
 
+        // Fractional scaling only pays off if the buffer can be handed over at
+        // device resolution, which needs a viewport; without one, ask for
+        // nothing and let the compositor scale a logical-sized buffer.
+        let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
+        let viewport = viewporter
+            .as_ref()
+            .map(|viewporter| viewporter.get_viewport(layer.wl_surface(), &qh, ()));
+        let fractional_scale = viewport.as_ref().and(
+            globals
+                .bind::<WpFractionalScaleManagerV1, _, _>(&qh, 1..=1, ())
+                .ok()
+                .map(|manager| manager.get_fractional_scale(layer.wl_surface(), &qh, ())),
+        );
+        if viewport.is_none() {
+            log::info!("no wp_viewporter; the compositor will scale the overlay itself");
+        }
+
         let pool = SlotPool::new(1, &shm).context("create the shm pool")?;
         let state = State {
             _idle_notification: idle_notification,
             session_idle: false,
+            viewport,
+            _fractional_scale: fractional_scale,
+            scale_120: SCALE_DENOMINATOR,
             registry: RegistryState::new(&globals),
             outputs: output_state,
             shm,
@@ -219,14 +262,55 @@ struct State {
     /// Held so the compositor keeps sending idle events; never read.
     _idle_notification: Option<ExtIdleNotificationV1>,
     session_idle: bool,
+    /// Scales the buffer down to the logical size the surface was given, so we
+    /// can hand over real device pixels. `None` on a compositor without
+    /// `wp_viewporter`, where the buffer has to be logical-sized.
+    viewport: Option<WpViewport>,
+    /// Held so the preferred scale keeps arriving; never read.
+    _fractional_scale: Option<WpFractionalScaleV1>,
+    /// The compositor's preferred scale, in 120ths. 120 means 1.0.
+    scale_120: u32,
     configured: bool,
     closed: bool,
 }
 
 impl State {
+    /// The compositor's preferred scale as a plain number.
+    fn scale_factor(&self) -> f64 {
+        f64::from(self.scale_120) / f64::from(SCALE_DENOMINATOR)
+    }
+
+    /// The buffer size in real device pixels, which is what we paint into when
+    /// there is a viewport to scale it back down.
+    fn device_size(&self) -> (i32, i32) {
+        if self.viewport.is_none() {
+            return self.size;
+        }
+        let scale = self.scale_factor();
+        let device = |logical: i32| {
+            // Rounding up: a buffer a hair too small would leave a gap along
+            // the right or bottom edge.
+            round((f64::from(logical) * scale).ceil())
+        };
+        (device(self.size.0), device(self.size.1))
+    }
+
+    /// Tells the viewport to squeeze the device-pixel buffer back into the
+    /// logical size the layer surface was configured at.
+    fn update_viewport(&self) {
+        // The preferred scale can arrive before the first configure, and a
+        // destination of 0x0 is a protocol error rather than a no-op.
+        if self.size.0 <= 0 || self.size.1 <= 0 {
+            return;
+        }
+        if let Some(viewport) = &self.viewport {
+            viewport.set_destination(self.size.0, self.size.1);
+        }
+    }
+
     /// (Re)allocates the shm buffers after a resize.
     fn ensure_buffers(&mut self) -> Result<()> {
-        let (width, height) = self.size;
+        let (width, height) = self.device_size();
         let stride = width * 4;
         for slot in &mut self.slots {
             if slot.buffer.is_some() {
@@ -249,8 +333,22 @@ impl State {
             return Ok(());
         }
         self.ensure_buffers()?;
-        let stride = usize::try_from(self.size.0).expect("non-negative width");
-        let scale = i32::try_from(self.config.scale).unwrap_or(1);
+        let (device_width, _) = self.device_size();
+        let stride = usize::try_from(device_width).expect("non-negative width");
+
+        // Everything below works in device pixels. The sprite is upscaled by a
+        // whole number even so - a 1-bit bitmap resampled by 1.25 turns to mush,
+        // so the animal ends up a few percent off its requested size instead.
+        let factor = self.scale_factor();
+        let pixel_scale = u32::try_from(round(f64::from(self.config.scale) * factor))
+            .unwrap_or(1)
+            .max(1);
+        let scale = i32::try_from(pixel_scale).unwrap_or(1);
+        let (x, y) = if self.viewport.is_some() {
+            (round(f64::from(x) * factor), round(f64::from(y) * factor))
+        } else {
+            (x, y)
+        };
 
         let target = Rect {
             x,
@@ -297,7 +395,7 @@ impl State {
             clear(pixels, stride, previous);
         }
         let mut canvas = Canvas { pixels, stride };
-        sprite.blit_argb(&mut canvas, x, y, self.config.scale, self.config.palette);
+        sprite.blit_argb(&mut canvas, x, y, pixel_scale, self.config.palette);
 
         let surface = self.layer.wl_surface();
         for rect in stale_rects.into_iter().flatten().chain([target]) {
@@ -343,6 +441,70 @@ fn bind_idle_notification(
     let millis = u32::try_from(after.as_millis()).unwrap_or(u32::MAX);
     log::info!("sleeping after {millis} ms of seat idleness");
     Some(notifier.get_idle_notification(millis, &seat, qh, ()))
+}
+
+impl Dispatch<WpFractionalScaleV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        (): &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
+            && scale != state.scale_120
+        {
+            log::info!(
+                "preferred scale is now {:.3}",
+                f64::from(scale) / f64::from(SCALE_DENOMINATOR)
+            );
+            state.scale_120 = scale;
+            // The buffers are sized in device pixels, so they are the wrong
+            // size now.
+            state.slots = [Slot::EMPTY, Slot::EMPTY];
+            state.update_viewport();
+        }
+    }
+}
+
+impl Dispatch<WpViewporter, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpViewporter,
+        _event: wp_viewporter::Event,
+        (): &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // No events.
+    }
+}
+
+impl Dispatch<WpViewport, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpViewport,
+        _event: wp_viewport::Event,
+        (): &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // No events.
+    }
+}
+
+impl Dispatch<WpFractionalScaleManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpFractionalScaleManagerV1,
+        _event: wp_fractional_scale_manager_v1::Event,
+        (): &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // No events.
+    }
 }
 
 impl Dispatch<ExtIdleNotifierV1, ()> for State {
@@ -449,6 +611,7 @@ impl LayerShellHandler for State {
             self.size = size;
             // The old buffers are the wrong size now.
             self.slots = [Slot::EMPTY, Slot::EMPTY];
+            self.update_viewport();
         }
         self.configured = true;
     }
