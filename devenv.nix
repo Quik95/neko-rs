@@ -11,6 +11,7 @@
     wayland-protocols
     wayland-scanner
     libxkbcommon
+    libxkbcommon.dev
     jq
     kdePackages.kdbusaddons # qdbus for poking KWin's /Scripting
   ];
