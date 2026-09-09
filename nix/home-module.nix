@@ -39,17 +39,13 @@ in {
         Without it nothing feeds the cursor position in and the animal sits
         still, so this only makes sense to turn off when running a different
         cursor source.
-      '';
-    };
 
-    enableKwinScript = lib.mkOption {
-      type = lib.types.bool;
-      default = true;
-      description = ''
-        Write the kwinrc entry that switches the script on.
-
-        KWin reads kwinrc at startup, so a freshly enabled script needs a
-        relog - or `qdbus org.kde.KWin /Scripting org.kde.kwin.Scripting.start`.
+        The script still has to be switched on in kwinrc
+        (`[Plugins] nekorsEnabled=true`). That entry is deliberately left to
+        you: kwinrc is a whole-file target in Home Manager, so writing it here
+        would collide with plasma-manager or with a hand-managed kwinrc. Under
+        plasma-manager, add
+        `programs.plasma.configFile.kwinrc.Plugins.nekorsEnabled = true`.
       '';
     };
   };
@@ -61,13 +57,6 @@ in {
       source = "${cfg.package}/share/kwin/scripts/nekors";
       recursive = true;
     };
-
-    # KWin decides what to load from kwinrc, keyed by the plugin id in
-    # metadata.json.
-    xdg.configFile."kwinrc".text = lib.mkIf cfg.enableKwinScript (lib.mkAfter ''
-      [Plugins]
-      nekorsEnabled=true
-    '');
 
     systemd.user.services.nekors = {
       Unit = {
