@@ -21,9 +21,15 @@ use smithay_client_toolkit::shell::wlr_layer::{
 use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
-use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_output, wl_shm, wl_surface};
-use wayland_client::{Connection, EventQueue, QueueHandle};
+use wayland_client::globals::{GlobalList, registry_queue_init};
+use wayland_client::protocol::{wl_output, wl_seat, wl_shm, wl_surface};
+use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{
+    self, ExtIdleNotificationV1,
+};
+use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::{
+    self, ExtIdleNotifierV1,
+};
 
 pub use smithay_client_toolkit::shell::wlr_layer::Layer;
 
@@ -48,6 +54,9 @@ pub struct OverlayConfig {
     /// Integer upscaling of the 32x32 sprite.
     pub scale: u32,
     pub palette: Palette,
+    /// How long the seat must be idle before [`Overlay::session_idle`] turns
+    /// true. `None` skips `ext_idle_notify_v1` entirely.
+    pub idle_after: Option<std::time::Duration>,
 }
 
 impl Default for OverlayConfig {
@@ -57,6 +66,7 @@ impl Default for OverlayConfig {
             output: None,
             scale: 1,
             palette: Palette::default(),
+            idle_after: None,
         }
     }
 }
@@ -119,8 +129,14 @@ impl Overlay {
         layer.set_input_region(Some(region.wl_region()));
         layer.commit();
 
+        let idle_notification = config
+            .idle_after
+            .and_then(|after| bind_idle_notification(&globals, &qh, after));
+
         let pool = SlotPool::new(1, &shm).context("create the shm pool")?;
         let state = State {
+            _idle_notification: idle_notification,
+            session_idle: false,
             registry: RegistryState::new(&globals),
             outputs: output_state,
             shm,
@@ -160,6 +176,14 @@ impl Overlay {
         self.state.closed
     }
 
+    /// True while the seat has been idle for longer than `idle_after`. Always
+    /// false when that was `None`, or when the compositor has no
+    /// `ext_idle_notify_v1`.
+    #[must_use]
+    pub fn session_idle(&self) -> bool {
+        self.state.session_idle
+    }
+
     /// Handles pending Wayland events - configures, output changes, closes.
     pub fn dispatch(&mut self) -> Result<()> {
         self.event_queue
@@ -189,6 +213,9 @@ struct State {
     slots: [Slot; 2],
     /// Which slot to prefer next frame - the one not currently on screen.
     next_slot: usize,
+    /// Held so the compositor keeps sending idle events; never read.
+    _idle_notification: Option<ExtIdleNotificationV1>,
+    session_idle: bool,
     configured: bool,
     closed: bool,
 }
@@ -281,6 +308,87 @@ impl State {
         self.layer.commit();
         self.slots[index].buffer = Some(buffer);
         Ok(())
+    }
+}
+
+/// Asks the compositor to say when the seat goes idle.
+///
+/// Optional on purpose: `ext_idle_notify_v1` is a staging protocol, and an
+/// animal that will not start because the compositor lacks it would be a poor
+/// trade for a nicety.
+fn bind_idle_notification(
+    globals: &GlobalList,
+    qh: &QueueHandle<State>,
+    after: std::time::Duration,
+) -> Option<ExtIdleNotificationV1> {
+    let notifier: ExtIdleNotifierV1 = match globals.bind(qh, 1..=2, ()) {
+        Ok(notifier) => notifier,
+        Err(error) => {
+            log::info!("no ext_idle_notify_v1 ({error}); --idle-notify will do nothing");
+            return None;
+        }
+    };
+    // The protocol wants a seat, and idleness is per seat. The first one is the
+    // one a single-user desktop has.
+    let seat: wl_seat::WlSeat = match globals.bind(qh, 1..=9, ()) {
+        Ok(seat) => seat,
+        Err(error) => {
+            log::info!("no wl_seat to watch for idleness ({error})");
+            return None;
+        }
+    };
+    let millis = u32::try_from(after.as_millis()).unwrap_or(u32::MAX);
+    log::info!("sleeping after {millis} ms of seat idleness");
+    Some(notifier.get_idle_notification(millis, &seat, qh, ()))
+}
+
+impl Dispatch<ExtIdleNotifierV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtIdleNotifierV1,
+        _event: ext_idle_notifier_v1::Event,
+        (): &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // The notifier itself has no events.
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_seat::WlSeat,
+        _event: wl_seat::Event,
+        (): &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // Capabilities and the seat name are of no interest: the surface takes
+        // no input, the seat is here only to hang the idle notification on.
+    }
+}
+
+impl Dispatch<ExtIdleNotificationV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ExtIdleNotificationV1,
+        event: ext_idle_notification_v1::Event,
+        (): &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_idle_notification_v1::Event::Idled => {
+                log::debug!("the seat went idle");
+                state.session_idle = true;
+            }
+            ext_idle_notification_v1::Event::Resumed => {
+                log::debug!("the seat came back");
+                state.session_idle = false;
+            }
+            _ => {}
+        }
     }
 }
 

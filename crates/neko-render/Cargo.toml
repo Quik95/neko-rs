@@ -16,3 +16,4 @@ bytemuck.workspace = true
 log.workspace = true
 smithay-client-toolkit.workspace = true
 wayland-client.workspace = true
+wayland-protocols.workspace = true

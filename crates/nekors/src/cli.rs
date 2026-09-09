@@ -130,6 +130,12 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.0)]
     pub idle_sleep: f64,
 
+    /// Seconds of seat idleness, as reported by the compositor's idle-notify
+    /// protocol, before the animal sleeps. Unlike --idle-sleep this counts the
+    /// keyboard too, and asks the compositor rather than guessing. 0 disables it.
+    #[arg(long, default_value_t = 0.0)]
+    pub idle_notify: f64,
+
     /// Don't claw at screen edges when the cursor is somewhere unreachable.
     #[arg(long)]
     pub no_wall_scratch: bool,

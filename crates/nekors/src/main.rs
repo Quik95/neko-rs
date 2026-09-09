@@ -50,6 +50,7 @@ fn run(args: &Cli) -> Result<()> {
             background: args.background.0,
             outline: args.outline.0,
         },
+        idle_after: (args.idle_notify > 0.0).then(|| Duration::from_secs_f64(args.idle_notify)),
     })?;
 
     let config = Config {
@@ -122,6 +123,12 @@ fn run(args: &Cli) -> Result<()> {
                     neko.sleep_now();
                 }
             }
+        }
+
+        // The compositor's word beats any guess made from cursor traffic: it
+        // sees the keyboard too, and it knows about the lock screen.
+        if overlay.session_idle() {
+            neko.sleep_now();
         }
 
         let frame = neko.frame();
