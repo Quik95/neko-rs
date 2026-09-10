@@ -39,6 +39,20 @@ rearranged mid-session are picked up as they happen.
 
 Pass `--output eDP-1` to keep it to a single screen.
 
+## Fullscreen windows
+
+A cat walking across a film is the one place nobody wants it, so by default the
+overlay steps off any monitor that has a fullscreen window on it. The same KWin
+script reports that (`org.nekors.Windows.SetFullscreen`) — no Wayland protocol
+tells a client what other windows are doing.
+
+The surface is *unmapped* rather than drawn empty: a mapped overlay, however
+transparent, stops the compositor from handing the fullscreen window straight to
+the display controller, which is exactly the cost worth avoiding. The animal
+keeps walking its usual route across the layout; it is simply not drawn there.
+
+Pass `--over-fullscreen` to keep it on screen regardless.
+
 ## Layout
 
 | Crate | Role |
@@ -132,6 +146,7 @@ Full list in `nekors --help` and `nekors(1)`; the less obvious ones:
 | `--idle-notify SECS` | Sleeps once the seat is idle for this long (`ext_idle_notify_v1`). |
 | `--type NAME` | oneko's alternative animals. |
 | `--output NAME` | Confines it to one monitor instead of all of them. |
+| `--over-fullscreen` | Stays on monitors showing a fullscreen window. |
 
 Under a fractional scale the overlay draws at device resolution through
 `wp_viewporter`, so the sprite stays sharp rather than being scaled up by the

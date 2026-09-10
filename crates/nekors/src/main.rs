@@ -14,7 +14,7 @@ use neko_render::{Overlay, OverlayConfig};
 use neko_sprites::Palette;
 
 use crate::cli::Cli;
-use crate::cursor::{CursorSource as _, DbusCursor};
+use crate::cursor::{CursorSource as _, DbusCursor, FullscreenSource as _};
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -134,6 +134,13 @@ fn run(args: &Cli) -> Result<()> {
         // sees the keyboard too, and it knows about the lock screen.
         if overlay.session_idle() {
             neko.sleep_now();
+        }
+
+        // Fullscreen windows are the compositor's business too; a Wayland
+        // client cannot see them. The animal keeps walking its usual route
+        // across the layout - it is simply not drawn where a film is.
+        if !args.over_fullscreen {
+            overlay.hide_outputs(&cursor.fullscreen_outputs());
         }
 
         let frame = neko.frame();
