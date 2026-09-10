@@ -26,7 +26,7 @@ let lastY = null;
 
 const timer = new QTimer();
 timer.interval = INTERVAL_MS;
-timer.timeout.connect(function () {
+timer.timeout.connect(timer, function () {
     const pos = workspace.cursorPos;
     const x = Math.round(pos.x);
     const y = Math.round(pos.y);
@@ -69,6 +69,12 @@ function report(force) {
         if (!w.fullScreen || w.minimized || !w.output) {
             continue;
         }
+        if (w.desktops.length > 0 && w.desktops.indexOf(workspace.currentDesktop) === -1) {
+            continue;
+        }
+        if (w.activities.length > 0 && w.activities.indexOf(workspace.currentActivity) === -1) {
+            continue;
+        }
         if (outputs.indexOf(w.output.name) === -1) {
             outputs.push(w.output.name);
         }
@@ -85,33 +91,29 @@ function report(force) {
     callDBus(SERVICE, WINDOWS_PATH, WINDOWS_INTERFACE, "SetFullscreen", joined);
 }
 
+function reportChanged() {
+    report(false);
+}
+
 function watch(window) {
-    window.fullScreenChanged.connect(function () {
-        report(false);
-    });
-    if (window.outputChanged) {
-        window.outputChanged.connect(function () {
-            report(false);
-        });
-    }
-    if (window.minimizedChanged) {
-        window.minimizedChanged.connect(function () {
-            report(false);
-        });
-    }
+    window.fullScreenChanged.connect(timer, reportChanged);
+    window.outputChanged.connect(timer, reportChanged);
+    window.minimizedChanged.connect(timer, reportChanged);
+    window.desktopsChanged.connect(timer, reportChanged);
+    window.activitiesChanged.connect(timer, reportChanged);
 }
 
 const existing = workspace.windowList();
 for (let i = 0; i < existing.length; i++) {
     watch(existing[i]);
 }
-workspace.windowAdded.connect(function (window) {
+workspace.windowAdded.connect(timer, function (window) {
     watch(window);
     report(false);
 });
-workspace.windowRemoved.connect(function () {
-    report(false);
-});
+workspace.windowRemoved.connect(timer, reportChanged);
+workspace.currentDesktopChanged.connect(timer, reportChanged);
+workspace.currentActivityChanged.connect(timer, reportChanged);
 report(true);
 
 // One call every two seconds, whatever happens - far below the cursor feed's
@@ -119,7 +121,7 @@ report(true);
 // restarts, the two agree again within a tick or two.
 const resync = new QTimer();
 resync.interval = RESYNC_MS;
-resync.timeout.connect(function () {
+resync.timeout.connect(timer, function () {
     report(true);
 });
 resync.start();
