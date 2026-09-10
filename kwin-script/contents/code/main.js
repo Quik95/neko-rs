@@ -50,9 +50,15 @@ timer.start();
 // entered a handful of times a day, and polling the window list at 30 Hz to
 // watch for it would cost far more than the cat itself.
 
+// How often the current list is sent again even though nothing changed. This
+// is what carries the state across a restart of nekors: it comes up knowing
+// nothing, and a purely signal-driven feed would leave it that way until the
+// next time someone entered or left fullscreen.
+const RESYNC_MS = 2000;
+
 let lastOutputs = null;
 
-function report() {
+function report(force) {
     const windows = workspace.windowList();
     const outputs = [];
     for (let i = 0; i < windows.length; i++) {
@@ -72,7 +78,7 @@ function report() {
     // signal that never arrives - a window dragged between monitors, say - is
     // corrected by the next one instead of leaving a screen dark forever.
     const joined = outputs.join(",");
-    if (joined === lastOutputs) {
+    if (joined === lastOutputs && !force) {
         return;
     }
     lastOutputs = joined;
@@ -80,12 +86,18 @@ function report() {
 }
 
 function watch(window) {
-    window.fullScreenChanged.connect(report);
+    window.fullScreenChanged.connect(function () {
+        report(false);
+    });
     if (window.outputChanged) {
-        window.outputChanged.connect(report);
+        window.outputChanged.connect(function () {
+            report(false);
+        });
     }
     if (window.minimizedChanged) {
-        window.minimizedChanged.connect(report);
+        window.minimizedChanged.connect(function () {
+            report(false);
+        });
     }
 }
 
@@ -95,9 +107,21 @@ for (let i = 0; i < existing.length; i++) {
 }
 workspace.windowAdded.connect(function (window) {
     watch(window);
-    report();
+    report(false);
 });
-workspace.windowRemoved.connect(report);
-report();
+workspace.windowRemoved.connect(function () {
+    report(false);
+});
+report(true);
+
+// One call every two seconds, whatever happens - far below the cursor feed's
+// own traffic, and it makes the whole thing self-healing: whichever side
+// restarts, the two agree again within a tick or two.
+const resync = new QTimer();
+resync.interval = RESYNC_MS;
+resync.timeout.connect(function () {
+    report(true);
+});
+resync.start();
 
 print("nekors: cursor feed started at " + INTERVAL_MS + " ms");
