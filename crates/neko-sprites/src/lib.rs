@@ -65,7 +65,7 @@ pub struct Canvas<'a> {
 impl Canvas<'_> {
     #[must_use]
     pub fn rows(&self) -> usize {
-        self.pixels.len() / self.stride
+        self.pixels.len().checked_div(self.stride).unwrap_or(0)
     }
 
     /// Writes one pixel, ignoring coordinates outside the buffer.
@@ -98,6 +98,12 @@ impl Default for Palette {
     }
 }
 
+fn premultiply(colour: u32) -> u32 {
+    let alpha = colour >> 24;
+    let channel = |shift: u32| (((colour >> shift) & 0xff) * alpha + 127) / 255;
+    (alpha << 24) | (channel(16) << 16) | (channel(8) << 8) | channel(0)
+}
+
 impl Sprite {
     fn get(bits: &[u8], stride: usize, x: u32, y: u32) -> bool {
         let index = y as usize * stride + (x as usize) / 8;
@@ -119,25 +125,24 @@ impl Sprite {
         assert!(scale > 0, "scale must be positive");
         let stride = (self.width as usize).div_ceil(8);
         let (dst_x, dst_y, scale) = (i64::from(dst_x), i64::from(dst_y), i64::from(scale));
+        let right = dst_x.saturating_add(i64::from(self.width).saturating_mul(scale));
+        let bottom = dst_y.saturating_add(i64::from(self.height).saturating_mul(scale));
+        let width = i64::try_from(canvas.stride).unwrap_or(i64::MAX);
+        let height = i64::try_from(canvas.rows()).unwrap_or(i64::MAX);
+        let background = premultiply(palette.background);
+        let outline = premultiply(palette.outline);
 
-        for y in 0..self.height {
-            for x in 0..self.width {
-                if !Self::get(self.mask, stride, x, y) {
-                    continue;
-                }
-                let colour = if Self::get(self.bits, stride, x, y) {
-                    palette.outline
-                } else {
-                    palette.background
-                };
-
-                // One source pixel becomes a scale x scale block.
-                let base_x = dst_x + i64::from(x) * scale;
-                let base_y = dst_y + i64::from(y) * scale;
-                for sub_y in 0..scale {
-                    for sub_x in 0..scale {
-                        canvas.put(base_x + sub_x, base_y + sub_y, colour);
-                    }
+        for dst_row in dst_y.max(0)..bottom.min(height) {
+            let y = u32::try_from((dst_row - dst_y) / scale).unwrap();
+            for dst_column in dst_x.max(0)..right.min(width) {
+                let x = u32::try_from((dst_column - dst_x) / scale).unwrap();
+                if Self::get(self.mask, stride, x, y) {
+                    let colour = if Self::get(self.bits, stride, x, y) {
+                        outline
+                    } else {
+                        background
+                    };
+                    canvas.put(dst_column, dst_row, colour);
                 }
             }
         }
@@ -147,6 +152,88 @@ impl Sprite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blit_premultiplies_straight_alpha_once() {
+        let sprite = Sprite {
+            name: "test",
+            width: 2,
+            height: 1,
+            bits: &[1],
+            mask: &[3],
+        };
+        for (colour, expected) in [
+            (0x8080_4020, 0x8040_2010),
+            (0x00ff_ffff, 0),
+            (0xffff_ffff, 0xffff_ffff),
+        ] {
+            let mut pixels = [0; 2];
+            sprite.blit_argb(
+                &mut Canvas {
+                    pixels: &mut pixels,
+                    stride: 2,
+                },
+                0,
+                0,
+                1,
+                Palette {
+                    background: colour,
+                    outline: colour,
+                },
+            );
+            assert_eq!(pixels, [expected; 2]);
+        }
+    }
+
+    #[test]
+    fn huge_scaled_blits_only_visit_visible_pixels() {
+        let sprite = Sprite {
+            name: "test",
+            width: 1,
+            height: 1,
+            bits: &[0],
+            mask: &[1],
+        };
+        let mut pixels = [0; 4];
+        let mut canvas = Canvas {
+            pixels: &mut pixels,
+            stride: 2,
+        };
+        sprite.blit_argb(
+            &mut canvas,
+            i32::MAX,
+            i32::MAX,
+            u32::MAX,
+            Palette::default(),
+        );
+        assert_eq!(canvas.pixels, &[0; 4]);
+        sprite.blit_argb(
+            &mut canvas,
+            i32::MIN,
+            i32::MIN,
+            u32::MAX,
+            Palette::default(),
+        );
+        assert_eq!(canvas.pixels, &[0xffff_ffff; 4]);
+    }
+
+    #[test]
+    fn zero_stride_has_no_rows_and_blits_nothing() {
+        let mut pixels = [7];
+        let mut canvas = Canvas {
+            pixels: &mut pixels,
+            stride: 0,
+        };
+        assert_eq!(canvas.rows(), 0);
+        Animal::Neko.sprite("mati2").unwrap().blit_argb(
+            &mut canvas,
+            0,
+            0,
+            u32::MAX,
+            Palette::default(),
+        );
+        assert_eq!(pixels, [7]);
+    }
 
     /// The full oneko set: two frames each of eight directions, four wall
     /// scratches and the idle animations.
