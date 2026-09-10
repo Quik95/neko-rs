@@ -9,7 +9,9 @@
   # Flags are passed through verbatim rather than mirrored as options: the CLI
   # is the source of truth, and `nekors --help` documents it better than this
   # file could.
-  arguments = lib.escapeShellArgs cfg.extraArgs;
+  escapeArgument = argument:
+    lib.replaceStrings ["%" "$"] ["%%" "$$"] (builtins.toJSON argument);
+  arguments = lib.concatMapStringsSep " " escapeArgument ([(lib.getExe cfg.package)] ++ cfg.extraArgs);
 in {
   options.services.nekors = {
     enable = lib.mkEnableOption "nekors, a cat that chases the cursor";
@@ -74,10 +76,10 @@ in {
       };
 
       Service = {
-        ExecStart = "${lib.getExe cfg.package} ${arguments}";
+        ExecStart = arguments;
         # The compositor can take the surface away on a session switch, and the
         # KWin script may come back later than we do.
-        Restart = "on-failure";
+        Restart = "always";
         RestartSec = 3;
         Slice = "session.slice";
       };
