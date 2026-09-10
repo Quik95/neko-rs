@@ -267,12 +267,38 @@ impl Overlay {
     pub fn draw(&mut self, sprite: &Sprite, x: i32, y: i32) {
         self.state.draw(sprite, x, y);
     }
+
+    /// Takes the animal off the outputs named in `names` and puts it back on
+    /// every other one.
+    ///
+    /// Meant for outputs showing a fullscreen window. Nothing here can tell
+    /// that by itself - a Wayland client is told nothing about anyone else's
+    /// windows - so the caller supplies the names; unknown ones are ignored,
+    /// which is what makes a stale report from a monitor that has since been
+    /// unplugged harmless.
+    pub fn hide_outputs<S: AsRef<str>>(&mut self, names: &[S]) {
+        for screen in &mut self.state.screens {
+            let hidden = names.iter().any(|name| name.as_ref() == screen.name);
+            if hidden != screen.hidden {
+                log::debug!(
+                    "screen {} ({}) is now {}",
+                    screen.id.0,
+                    screen.name,
+                    if hidden { "hidden" } else { "visible" }
+                );
+                screen.hidden = hidden;
+            }
+        }
+    }
 }
 
 /// One output: its surface, its buffers, and where it sits in the layout.
 struct Screen {
     id: ScreenId,
     output: wl_output::WlOutput,
+    /// The compositor's name for this output, e.g. `"HDMI-A-1"`. What the
+    /// caller uses to say which screens are covered by a fullscreen window.
+    name: String,
     layer: LayerSurface,
     /// Scales the buffer down to the logical size the surface was given, so we
     /// can hand over real device pixels. `None` on a compositor without
@@ -293,6 +319,14 @@ struct Screen {
     /// Which slot to prefer next frame - the one not currently on screen.
     next_slot: usize,
     configured: bool,
+    /// Set while something is fullscreen here. The surface is unmapped rather
+    /// than drawn transparent: a mapped overlay, however empty, keeps the
+    /// compositor from handing the fullscreen window straight to the display
+    /// controller, which is the whole cost we are trying to avoid.
+    hidden: bool,
+    /// Whether the null buffer has already been committed, so hiding and
+    /// showing are each done once rather than every frame.
+    unmapped: bool,
 }
 
 impl Screen {
@@ -348,6 +382,36 @@ impl Screen {
         Ok(())
     }
 
+    /// Takes the surface off the screen entirely.
+    ///
+    /// A null buffer unmaps a layer surface, which is what actually lets the
+    /// compositor scan the fullscreen window out directly; a transparent
+    /// buffer would look the same and cost the same as any other overlay. The
+    /// buffers go with it, both to hand the memory back and so that the frame
+    /// after a remap starts from a cleared canvas instead of damaging against
+    /// pixels that are no longer on screen.
+    fn unmap(&mut self) {
+        let surface = self.layer.wl_surface();
+        surface.attach(None, 0, 0);
+        surface.commit();
+        self.slots = [Slot::EMPTY, Slot::EMPTY];
+        self.unmapped = true;
+        // An unmapped layer surface is back where it started: attaching a
+        // buffer before the compositor has configured it again is a protocol
+        // error that kills the connection, so it counts as unconfigured until
+        // that configure arrives.
+        self.configured = false;
+    }
+
+    /// Asks the compositor to configure the surface again after an unmap.
+    ///
+    /// A commit with no buffer is what starts that round - the same handshake
+    /// the surface went through when it was first created.
+    fn remap(&mut self) {
+        self.layer.wl_surface().commit();
+        self.unmapped = false;
+    }
+
     /// Draws the sprite at `(x, y)` in this output's own logical pixels.
     ///
     /// The caller has already translated out of the layout-wide space, so an
@@ -361,6 +425,18 @@ impl Screen {
         x: i32,
         y: i32,
     ) -> Result<()> {
+        if self.hidden {
+            if !self.unmapped {
+                self.unmap();
+            }
+            return Ok(());
+        }
+        if self.unmapped {
+            self.remap();
+            // The configure that remapping asks for arrives on a later
+            // dispatch; until it does there is nothing to draw on.
+            return Ok(());
+        }
         if !self.configured || self.size.0 <= 0 || self.size.1 <= 0 {
             return Ok(());
         }
@@ -561,6 +637,7 @@ impl State {
         self.screens.push(Screen {
             id,
             output: output.clone(),
+            name: name.clone(),
             layer,
             viewport,
             _fractional_scale: fractional_scale,
@@ -570,6 +647,8 @@ impl State {
             slots: [Slot::EMPTY, Slot::EMPTY],
             next_slot: 0,
             configured: false,
+            hidden: false,
+            unmapped: false,
         });
     }
 

@@ -13,6 +13,10 @@ const SERVICE = "org.nekors.Cursor";
 const PATH = "/Cursor";
 const INTERFACE = "org.nekors.Cursor";
 
+// The other half of the feed: which screens are showing a fullscreen window.
+const WINDOWS_PATH = "/Windows";
+const WINDOWS_INTERFACE = "org.nekors.Windows";
+
 // ~30 Hz. nekors only thinks eight times a second, but sampling faster keeps
 // the position it thinks with fresh.
 const INTERVAL_MS = 33;
@@ -38,5 +42,62 @@ timer.timeout.connect(function () {
     callDBus(SERVICE, PATH, INTERFACE, "SetPos", x, y);
 });
 timer.start();
+
+// Fullscreen reporting.
+//
+// nekors cannot see anyone else's windows - no Wayland protocol offers that -
+// so it is told. Unlike the cursor this is driven by signals: full screen is
+// entered a handful of times a day, and polling the window list at 30 Hz to
+// watch for it would cost far more than the cat itself.
+
+let lastOutputs = null;
+
+function report() {
+    const windows = workspace.windowList();
+    const outputs = [];
+    for (let i = 0; i < windows.length; i++) {
+        const w = windows[i];
+        // Any fullscreen window counts, not just the active one: a film on the
+        // second monitor stops being active the moment you click back to your
+        // work, and that is exactly when the cat must not walk onto it.
+        if (!w.fullScreen || w.minimized || !w.output) {
+            continue;
+        }
+        if (outputs.indexOf(w.output.name) === -1) {
+            outputs.push(w.output.name);
+        }
+    }
+
+    // The whole list is recomputed rather than tracked incrementally, so a
+    // signal that never arrives - a window dragged between monitors, say - is
+    // corrected by the next one instead of leaving a screen dark forever.
+    const joined = outputs.join(",");
+    if (joined === lastOutputs) {
+        return;
+    }
+    lastOutputs = joined;
+    callDBus(SERVICE, WINDOWS_PATH, WINDOWS_INTERFACE, "SetFullscreen", joined);
+}
+
+function watch(window) {
+    window.fullScreenChanged.connect(report);
+    if (window.outputChanged) {
+        window.outputChanged.connect(report);
+    }
+    if (window.minimizedChanged) {
+        window.minimizedChanged.connect(report);
+    }
+}
+
+const existing = workspace.windowList();
+for (let i = 0; i < existing.length; i++) {
+    watch(existing[i]);
+}
+workspace.windowAdded.connect(function (window) {
+    watch(window);
+    report();
+});
+workspace.windowRemoved.connect(report);
+report();
 
 print("nekors: cursor feed started at " + INTERVAL_MS + " ms");

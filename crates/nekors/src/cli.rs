@@ -108,6 +108,12 @@ pub struct Cli {
     #[arg(long)]
     pub output: Option<String>,
 
+    /// Stay on screens showing a fullscreen window, instead of stepping off
+    /// them. Off by default: a cat walking across a film is the one place
+    /// nobody wants it. Needs the `KWin` script, which is what reports it.
+    #[arg(long)]
+    pub over_fullscreen: bool,
+
     /// Integer upscaling. 32x32 is a speck on a 4K screen.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=16))]
     pub scale: u32,
