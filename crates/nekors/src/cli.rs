@@ -133,21 +133,23 @@ pub struct Cli {
 
     /// Seconds without the cursor moving before the animal is put to sleep.
     /// 0 disables it and leaves the usual idle chain to get there.
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.0, value_parser = idle_seconds)]
     pub idle_sleep: f64,
 
     /// Seconds of seat idleness, as reported by the compositor's idle-notify
     /// protocol, before the animal sleeps. Unlike --idle-sleep this counts the
     /// keyboard too, and asks the compositor rather than guessing. 0 disables it.
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.0, value_parser = idle_seconds)]
     pub idle_notify: f64,
 
     /// Don't claw at screen edges when the cursor is somewhere unreachable.
     #[arg(long)]
     pub no_wall_scratch: bool,
 
-    /// Keep running if the compositor closes the surface, instead of exiting.
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Exit with an error when the compositor closes the surfaces, allowing a supervisor to restart; does not recreate surfaces. Without this flag, exit successfully."
+    )]
     pub survive_close: bool,
 
     /// Ignore the cursor and let the animal idle where it stands, the way
@@ -162,6 +164,13 @@ pub struct Cli {
     /// Print a roff man page and exit.
     #[arg(long)]
     pub man: bool,
+}
+
+fn idle_seconds(value: &str) -> Result<f64> {
+    let seconds: f64 = value.parse()?;
+    std::time::Duration::try_from_secs_f64(seconds)
+        .map_err(|error| anyhow::anyhow!("invalid idle duration: {error}"))?;
+    Ok(seconds)
 }
 
 impl AnimalArg {
@@ -182,5 +191,27 @@ impl AnimalArg {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_durations_are_checked_during_parsing() {
+        for flag in ["--idle-sleep", "--idle-notify"] {
+            for value in ["inf", "NaN", "-inf", "-1", "1e300"] {
+                assert!(Cli::try_parse_from(["nekors", &format!("{flag}={value}")]).is_err());
+            }
+            for value in ["0", "0.5", "3600"] {
+                assert!(Cli::try_parse_from(["nekors", &format!("{flag}={value}")]).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn colour_parser_preserves_straight_alpha() {
+        assert_eq!("#80804020".parse::<Colour>().unwrap().0, 0x8080_4020);
     }
 }
