@@ -30,12 +30,9 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [pkg-config installShellFiles makeWrapper];
   buildInputs = [wayland libxkbcommon];
 
-  # wayland is dlopened by the client library, so it has to stay findable at
-  # runtime rather than only at link time.
+  # The completions and the man page are generated from the binary before it is
+  # wrapped, so the wrapper cannot leak its own name into them.
   postInstall = ''
-    wrapProgram $out/bin/nekors \
-      --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [wayland libxkbcommon]}
-
     installShellCompletion --cmd nekors \
       --bash <($out/bin/nekors --completions bash) \
       --fish <($out/bin/nekors --completions fish) \
@@ -49,6 +46,13 @@ rustPlatform.buildRustPackage {
     # can link it where KWin looks.
     mkdir -p $out/share/kwin/scripts/nekors
     cp -r kwin-script/. $out/share/kwin/scripts/nekors/
+
+    # Defensive rather than currently required: nothing in the dependency set is
+    # dlopened -- the wayland protocol is implemented in Rust and the xkbcommon
+    # bindings get dropped by --as-needed -- but a code path that did reach for
+    # xkb would need the libraries findable at runtime.
+    wrapProgram $out/bin/nekors \
+      --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [wayland libxkbcommon]}
   '';
 
   meta = {
