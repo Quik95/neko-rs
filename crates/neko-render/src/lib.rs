@@ -663,7 +663,13 @@ impl State {
     }
 
     /// Replaces a hidden screen's surface with a new one, putting it back on
-    /// screen. The old surface goes away with the value it is swapped out of.
+    /// screen.
+    ///
+    /// Dropping the old `LayerSurface` destroys the role object and the
+    /// `wl_surface` under it, so nothing accumulates there. The viewport and
+    /// the fractional-scale object are plain protocol proxies with no such
+    /// courtesy: they have to be destroyed by hand, or every trip in and out
+    /// of fullscreen would leave a pair of them behind in the compositor.
     fn rebuild_surface(&mut self, id: ScreenId) {
         let Some(screen) = self.screens.iter().find(|screen| screen.id == id) else {
             return;
@@ -673,6 +679,13 @@ impl State {
         let Some(screen) = self.screen_mut(id) else {
             return;
         };
+        // Before the surface they hang off goes away with the old layer.
+        if let Some(old) = screen.viewport.take() {
+            old.destroy();
+        }
+        if let Some(old) = screen.fractional_scale.take() {
+            old.destroy();
+        }
         screen.layer = layer;
         screen.viewport = viewport;
         screen.fractional_scale = fractional_scale;
