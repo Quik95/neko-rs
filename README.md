@@ -46,6 +46,11 @@ overlay steps off any monitor that has a fullscreen window on it. The same KWin
 script reports that (`org.nekors.Windows.SetFullscreen`) — no Wayland protocol
 tells a client what other windows are doing.
 
+While the cursor itself is on such a monitor the animal stops chasing it and
+idles where it stands: it could not reach it anyway, and following it would
+just pin the cat against the edge of the neighbouring screen for the length of
+the film.
+
 The surface is *unmapped* rather than drawn empty: a mapped overlay, however
 transparent, stops the compositor from handing the fullscreen window straight to
 the display controller, which is exactly the cost worth avoiding. The animal
