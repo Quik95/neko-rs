@@ -149,8 +149,9 @@ pub struct Neko {
     state_count: u32,
     mouse: (i32, i32),
     prev_mouse: (i32, i32),
-    move_dx: i32,
-    move_dy: i32,
+    move_dx: f64,
+    move_dy: f64,
+    remainder: (f64, f64),
     /// Where it was at the end of the previous tick.
     last_position: (i32, i32),
 }
@@ -159,8 +160,8 @@ impl Neko {
     #[must_use]
     pub fn new(config: Config, bounds: (i32, i32)) -> Self {
         let start = (
-            bounds.0 / 2 - SPRITE_SIZE / 2,
-            bounds.1 / 2 - SPRITE_SIZE / 2,
+            (bounds.0 / 2 - SPRITE_SIZE / 2).max(0),
+            (bounds.1 / 2 - SPRITE_SIZE / 2).max(0),
         );
         Self {
             config,
@@ -172,8 +173,9 @@ impl Neko {
             state_count: 0,
             mouse: start,
             prev_mouse: start,
-            move_dx: 0,
-            move_dy: 0,
+            move_dx: 0.0,
+            move_dy: 0.0,
+            remainder: (0.0, 0.0),
             last_position: start,
         }
     }
@@ -252,8 +254,11 @@ impl Neko {
                 }
             }
             State::Move(_) => {
-                self.x += self.move_dx;
-                self.y += self.move_dy;
+                let dx = self.move_dx + self.remainder.0;
+                let dy = self.move_dy + self.remainder.1;
+                self.x = self.x.saturating_add(truncate(dx));
+                self.y = self.y.saturating_add(truncate(dy));
+                self.remainder = (dx.fract(), dy.fract());
                 self.face_the_cursor();
                 // Pinned against an edge and not actually getting anywhere
                 // means it has arrived as close as it is going to get.
@@ -278,6 +283,9 @@ impl Neko {
         self.tick_count = 0;
         self.state_count = 0;
         self.state = state;
+        if !state.is_moving() {
+            self.remainder = (0.0, 0.0);
+        }
     }
 
     /// oneko counts animation frames and bumps the state timer on every other
@@ -305,9 +313,9 @@ impl Neko {
 
     /// True once the cursor has moved further than the idle deadzone.
     fn cursor_moved(&self) -> bool {
-        let space = self.config.idle_space;
-        (self.prev_mouse.0 - self.mouse.0).abs() > space
-            || (self.prev_mouse.1 - self.mouse.1).abs() > space
+        let space = i64::from(self.config.idle_space);
+        (i64::from(self.prev_mouse.0) - i64::from(self.mouse.0)).abs() > space
+            || (i64::from(self.prev_mouse.1) - i64::from(self.mouse.1)).abs() > space
     }
 
     /// Aims at the cursor and caps the step at `speed` pixels.
@@ -318,18 +326,19 @@ impl Neko {
         // The animal chases with the middle of its bottom edge - that is where
         // its paws are, and it is what makes it look like it lands on the
         // cursor rather than covering it.
-        let dx = f64::from(self.mouse.0 - self.x - SPRITE_SIZE / 2);
-        let dy = f64::from(self.mouse.1 - self.y - SPRITE_SIZE);
+        let dx = f64::from(self.mouse.0) - f64::from(self.x) - f64::from(SPRITE_SIZE / 2);
+        let dy = f64::from(self.mouse.1) - f64::from(self.y) - f64::from(SPRITE_SIZE);
         let length = dx.hypot(dy);
 
         (self.move_dx, self.move_dy) = if length == 0.0 {
-            (0, 0)
+            (0.0, 0.0)
         } else if length <= self.config.speed {
-            (truncate(dx), truncate(dy))
+            self.remainder = (0.0, 0.0);
+            (dx, dy)
         } else {
             (
-                truncate(self.config.speed * dx / length),
-                truncate(self.config.speed * dy / length),
+                self.config.speed * dx / length,
+                self.config.speed * dy / length,
             )
         };
     }
@@ -346,14 +355,14 @@ impl Neko {
     }
 
     fn heading(&self) -> Option<Direction> {
-        if (self.move_dx, self.move_dy) == (0, 0) {
+        if (self.move_dx, self.move_dy) == (0.0, 0.0) {
             return None;
         }
-        let dx = f64::from(self.move_dx);
+        let dx = self.move_dx;
         // Screen y grows downwards; flip it so the angle is the usual one.
-        let dy = f64::from(-self.move_dy);
+        let dy = -self.move_dy;
         let sin_theta = dy / dx.hypot(dy);
-        let rightwards = self.move_dx > 0;
+        let rightwards = self.move_dx > 0.0;
 
         Some(if sin_theta > SIN_PI_PER_8_TIMES_3 {
             Direction::Up
@@ -385,13 +394,13 @@ impl Neko {
         if !self.config.scratch_walls {
             return None;
         }
-        if self.move_dx < 0 && self.x <= 0 {
+        if self.move_dx < 0.0 && self.x <= 0 {
             Some(Wall::Left)
-        } else if self.move_dx > 0 && self.x >= self.bounds.0 - SPRITE_SIZE {
+        } else if self.move_dx > 0.0 && self.x >= self.bounds.0.saturating_sub(SPRITE_SIZE) {
             Some(Wall::Right)
-        } else if self.move_dy < 0 && self.y <= 0 {
+        } else if self.move_dy < 0.0 && self.y <= 0 {
             Some(Wall::Up)
-        } else if self.move_dy > 0 && self.y >= self.bounds.1 - SPRITE_SIZE {
+        } else if self.move_dy > 0.0 && self.y >= self.bounds.1.saturating_sub(SPRITE_SIZE) {
             Some(Wall::Down)
         } else {
             None
@@ -400,8 +409,8 @@ impl Neko {
 
     /// Clamps into the screen, reporting whether it had to.
     fn clamp_into_bounds(&mut self) -> bool {
-        let max_x = (self.bounds.0 - SPRITE_SIZE).max(0);
-        let max_y = (self.bounds.1 - SPRITE_SIZE).max(0);
+        let max_x = (self.bounds.0.saturating_sub(SPRITE_SIZE)).max(0);
+        let max_y = (self.bounds.1.saturating_sub(SPRITE_SIZE)).max(0);
         let clamped = (self.x.clamp(0, max_x), self.y.clamp(0, max_y));
         let hit_edge = clamped != (self.x, self.y);
         (self.x, self.y) = clamped;
@@ -414,6 +423,54 @@ mod tests {
     use super::*;
 
     const BOUNDS: (i32, i32) = (1000, 800);
+
+    #[test]
+    fn fractional_diagonal_steps_reach_the_cursor() {
+        for speed in [0.25, 1.0] {
+            for sign in [-1, 1] {
+                let mut neko = Neko::new(
+                    Config {
+                        speed,
+                        ..Config::default()
+                    },
+                    BOUNDS,
+                );
+                let start = neko.position();
+                let target = (start.0 + 16 + sign * 50, start.1 + 32 + sign * 50);
+                tick_until(&mut neko, target, |n| n.state().is_moving());
+                tick_until(&mut neko, target, |n| n.state() == State::Stop);
+                assert_eq!(neko.position(), (target.0 - 16, target.1 - 32));
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_coordinates_and_bounds_do_not_overflow() {
+        let mut neko = Neko::new(
+            Config {
+                speed: f64::from(i32::MAX),
+                ..Config::default()
+            },
+            (i32::MAX, i32::MAX),
+        );
+        for cursor in [(i32::MIN, i32::MIN), (i32::MAX, i32::MAX)] {
+            for _ in 0..100 {
+                neko.tick(cursor);
+            }
+        }
+        neko.set_bounds((i32::MIN, i32::MIN));
+        assert_eq!(neko.position(), (0, 0));
+        for _ in 0..100 {
+            neko.tick((i32::MAX, i32::MIN));
+        }
+    }
+
+    #[test]
+    fn initial_position_is_clamped_in_tiny_bounds() {
+        for bounds in [(0, 0), (1, 31), (i32::MIN, i32::MIN)] {
+            assert_eq!(Neko::new(Config::default(), bounds).position(), (0, 0));
+        }
+    }
 
     fn neko() -> Neko {
         Neko::new(Config::default(), BOUNDS)
