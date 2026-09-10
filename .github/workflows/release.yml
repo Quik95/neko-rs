@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to open a draft release for
+        required: true
+
+permissions:
+  contents: read
+
+# No binaries are attached: a build out of this repository only runs where the
+# matching /nix/store is present, so the flake -- `nix run github:quik95/neko-rs`
+# or the home-manager module -- is the way to install nekors. This job exists so
+# that tagging is enough to get a release with notes started.
+jobs:
+  release:
+    name: open a draft release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # The release is left as a draft: actually publishing it, and whatever
+      # editing the notes need, stays a human decision.
+      - name: create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "release for $TAG already exists, leaving it alone"
+            exit 0
+          fi
+          gh release create "$TAG" --draft --generate-notes --title "$TAG"

@@ -1,0 +1,196 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch makes the in-flight run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Keep cargo quiet about incremental artifacts it cannot reuse across runners.
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # Everything that runs out of the flake dev shell: the same rustc, clippy and
+  # rustfmt that `nix develop` hands a contributor, pinned by flake.lock.
+  rust:
+    name: fmt / clippy / test / doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          extra_nix_config: |
+            accept-flake-config = true
+
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-rust-${{ hashFiles('flake.lock', '**/*.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-rust-
+          gc-max-store-size-linux: 2G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-rust-
+          purge-created: 604800
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # rust-cache keys off the toolchain it finds on PATH, which only
+          # exists inside the dev shell.
+          prefix-key: nix-devshell
+
+      # Only the tracked files: alejandra would otherwise walk into the
+      # generated .devenv/ tree, which is not ours to format.
+      - name: alejandra --check
+        run: git ls-files -z '*.nix' | xargs -0 nix develop -c alejandra --check
+
+      - name: cargo fmt --check
+        run: nix develop -c cargo fmt --all --check
+
+      # --all-targets goes beyond the pre-commit hook: it also lints build.rs,
+      # the contact_sheet example and the #[cfg(test)] blocks.
+      - name: cargo clippy
+        run: nix develop -c cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: nix develop -c cargo test --workspace --all-targets --locked
+
+      - name: cargo doc
+        run: nix develop -c cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # The flake is how the program is actually installed, so the packaged build is
+  # the one that matters: it is the only thing exercising the fileset allowlist,
+  # the completions/man generation and the wayland wrapper in postInstall.
+  package:
+    name: nix build (${{ matrix.system }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          extra_nix_config: |
+            accept-flake-config = true
+
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ matrix.system }}-package-${{ hashFiles('flake.lock', '**/*.nix', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ matrix.system }}-package-
+          gc-max-store-size-linux: 2G
+          purge: true
+          purge-prefixes: nix-${{ matrix.system }}-package-
+          purge-created: 604800
+
+      - name: nix build
+        run: nix build .#nekors -L
+
+      # postInstall silently producing nothing would otherwise ship a package
+      # that is missing half the program.
+      - name: check the built package
+        run: |
+          set -euo pipefail
+          ./result/bin/nekors --version
+          ./result/bin/nekors --help > /dev/null
+          test -s result/share/man/man1/nekors.1.gz
+          test -s result/share/fish/vendor_completions.d/nekors.fish
+          test -s result/share/bash-completion/completions/nekors.bash
+          test -s result/share/zsh/site-functions/_nekors
+          test -s result/share/kwin/scripts/nekors/metadata.json
+          test -s result/share/kwin/scripts/nekors/contents/code/main.js
+
+  # Catches a stale flake.lock and any output that stopped evaluating, including
+  # the home-manager module and the aarch64 attributes.
+  flake-check:
+    name: nix flake check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          extra_nix_config: |
+            accept-flake-config = true
+
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-flake-${{ hashFiles('flake.lock', '**/*.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-flake-
+          gc-max-store-size-linux: 1G
+
+      - run: nix flake check --all-systems -L
+
+  deps:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-deny-${{ hashFiles('flake.lock', '**/*.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-deny-
+          gc-max-store-size-linux: 1G
+
+      - run: nix develop -c cargo deny --all-features check
+
+  # The KWin script is the other half of the program and nothing else compiles
+  # it, so a syntax error would only surface at loadScript time. node and jq are
+  # preinstalled on the runner, so this needs no Nix and finishes in seconds.
+  kwin-script:
+    name: kwin-script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: node --check kwin-script/contents/code/main.js
+      - run: jq -e . kwin-script/metadata.json > /dev/null
+
+  workflows:
+    name: actionlint / zizmor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-workflows-${{ hashFiles('flake.lock', '**/*.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-workflows-
+          gc-max-store-size-linux: 1G
+
+      - run: nix develop -c actionlint
+      - run: nix develop -c zizmor .github/workflows

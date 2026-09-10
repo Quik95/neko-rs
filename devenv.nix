@@ -14,6 +14,10 @@
     libxkbcommon.dev
     jq
     kdePackages.qttools # qdbus, for poking KWin's /Scripting
+
+    # The same tools CI runs, so a failure there is reproducible here.
+    cargo-deny
+    zizmor
   ];
 
   env.RUST_LOG = "nekors=info";
@@ -56,5 +60,6 @@
       settings.denyWarnings = true;
     };
     alejandra.enable = true;
+    actionlint.enable = true;
   };
 }
