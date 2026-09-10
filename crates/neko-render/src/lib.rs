@@ -348,6 +348,7 @@ struct Screen {
     /// Which slot to prefer next frame - the one not currently on screen.
     next_slot: usize,
     configured: bool,
+    needs_redraw: bool,
     /// Set while something is fullscreen here. The surface is unmapped rather
     /// than drawn transparent: a mapped overlay, however empty, keeps the
     /// compositor from handing the fullscreen window straight to the display
@@ -355,7 +356,26 @@ struct Screen {
     hidden: bool,
 }
 
+impl Drop for Screen {
+    fn drop(&mut self) {
+        self.destroy_extensions();
+    }
+}
+
 impl Screen {
+    fn destroy_extensions(&mut self) {
+        if let Some(viewport) = self.viewport.take() {
+            viewport.destroy();
+        }
+        if let Some(scale) = self.fractional_scale.take() {
+            scale.destroy();
+        }
+    }
+
+    fn invalidate_buffers(&mut self) {
+        self.needs_redraw |= invalidate_slots(&mut self.slots);
+    }
+
     /// The compositor's preferred scale as a plain number.
     fn scale_factor(&self) -> f64 {
         f64::from(self.scale_120) / f64::from(SCALE_DENOMINATOR)
@@ -412,10 +432,7 @@ impl Screen {
     ///
     /// A null buffer unmaps a layer surface, which is what actually lets the
     /// compositor scan the fullscreen window out directly; a transparent
-    /// buffer would look the same and cost the same as any other overlay. The
-    /// buffers go with it, both to hand the memory back and so that the frame
-    /// after a remap starts from a cleared canvas instead of damaging against
-    /// pixels that are no longer on screen.
+    /// buffer would look the same and cost the same as any other overlay.
     fn unmap(&mut self) {
         let surface = self.layer.wl_surface();
         surface.attach(None, 0, 0);
@@ -426,6 +443,7 @@ impl Screen {
         // error that kills the connection, so it counts as unconfigured until
         // that configure arrives.
         self.configured = false;
+        self.needs_redraw = false;
     }
 
     /// Draws the sprite at `(x, y)` in this output's own logical pixels.
@@ -445,7 +463,6 @@ impl Screen {
         if self.hidden || !self.configured || self.size.0 <= 0 || self.size.1 <= 0 {
             return Ok(());
         }
-        self.ensure_buffers(pool)?;
         let (device_width, device_height) = self.device_size();
         let stride = usize::try_from(device_width).expect("non-negative width");
 
@@ -474,7 +491,8 @@ impl Screen {
         // the animal is elsewhere and was elsewhere last frame too. Committing
         // anyway would wake the compositor for every screen eight times a
         // second to change nothing.
-        let touched = target.hits(device_width, device_height)
+        let touched = self.needs_redraw
+            || target.hits(device_width, device_height)
             || self
                 .slots
                 .iter()
@@ -483,6 +501,8 @@ impl Screen {
         if !touched {
             return Ok(());
         }
+
+        self.ensure_buffers(pool)?;
 
         // Taken out so the buffer and the pool can be borrowed at once; put
         // back before returning. The preferred slot is the one not on screen,
@@ -525,6 +545,9 @@ impl Screen {
         sprite.blit_argb(&mut canvas, x, y, pixel_scale, config.palette);
 
         let surface = self.layer.wl_surface();
+        if self.needs_redraw {
+            surface.damage_buffer(0, 0, device_width, device_height);
+        }
         for rect in stale_rects.into_iter().flatten().chain([target]) {
             surface.damage_buffer(rect.x, rect.y, rect.width, rect.height);
         }
@@ -534,6 +557,7 @@ impl Screen {
             .attach_to(surface)
             .context("attach the buffer to the surface")?;
         self.layer.commit();
+        self.needs_redraw = false;
         self.slots[index].buffer = Some(buffer);
         Ok(())
     }
@@ -546,8 +570,6 @@ struct State {
     layer_shell: LayerShell,
     outputs: OutputState,
     shm: Shm,
-    /// One pool behind every surface: the buffers are small and the pool grows
-    /// to fit, so there is nothing to gain from one each.
     pool: SlotPool,
     config: OverlayConfig,
     viewporter: Option<WpViewporter>,
@@ -620,8 +642,10 @@ impl State {
             slots: [Slot::EMPTY, Slot::EMPTY],
             next_slot: 0,
             configured: false,
+            needs_redraw: false,
             hidden: false,
         });
+        self.closed = false;
     }
 
     /// Builds a fresh overlay surface for one output.
@@ -694,17 +718,14 @@ impl State {
             return;
         };
         // Before the surface they hang off goes away with the old layer.
-        if let Some(old) = screen.viewport.take() {
-            old.destroy();
-        }
-        if let Some(old) = screen.fractional_scale.take() {
-            old.destroy();
-        }
+        screen.destroy_extensions();
         screen.layer = layer;
         screen.viewport = viewport;
         screen.fractional_scale = fractional_scale;
+        screen.scale_120 = SCALE_DENOMINATOR;
+        screen.update_viewport();
         // Everything below is what the coming configure will fill in again.
-        screen.size = (0, 0);
+        screen.needs_redraw = false;
         screen.slots = [Slot::EMPTY, Slot::EMPTY];
         screen.next_slot = 0;
         screen.configured = false;
@@ -718,25 +739,17 @@ impl State {
         self.screens.iter().any(|screen| screen.configured)
     }
 
-    /// The bounding box of every configured output, in global logical pixels:
-    /// `(x, y, width, height)`.
-    ///
     /// A layout with a hole in it - two monitors of different heights, say -
     /// leaves the animal able to walk into space no output covers, where it is
     /// simply not drawn. That beats the alternative of it being unable to
     /// cross at all.
     fn bounds(&self) -> (i32, i32, i32, i32) {
-        let mut bounds: Option<(i32, i32, i32, i32)> = None;
-        for screen in self.screens.iter().filter(|screen| screen.configured) {
-            let (left, top) = screen.position;
-            let (right, bottom) = (left + screen.size.0, top + screen.size.1);
-            bounds = Some(match bounds {
-                None => (left, top, right, bottom),
-                Some((x, y, r, b)) => (x.min(left), y.min(top), r.max(right), b.max(bottom)),
-            });
-        }
-        let (x, y, right, bottom) = bounds.unwrap_or((0, 0, 0, 0));
-        (x, y, right - x, bottom - y)
+        layout_bounds(self.screens.iter().map(|screen| Rect {
+            x: screen.position.0,
+            y: screen.position.1,
+            width: screen.size.0,
+            height: screen.size.1,
+        }))
     }
 
     /// Never fails as a whole: a screen that cannot be drawn on says so in the
@@ -801,7 +814,7 @@ fn bind_idle_notification(
 impl Dispatch<WpFractionalScaleV1, ScreenId> for State {
     fn event(
         state: &mut Self,
-        _proxy: &WpFractionalScaleV1,
+        proxy: &WpFractionalScaleV1,
         event: wp_fractional_scale_v1::Event,
         id: &ScreenId,
         _conn: &Connection,
@@ -813,7 +826,7 @@ impl Dispatch<WpFractionalScaleV1, ScreenId> for State {
         let Some(screen) = state.screen_mut(*id) else {
             return;
         };
-        if scale == screen.scale_120 {
+        if screen.fractional_scale.as_ref() != Some(proxy) || scale == screen.scale_120 {
             return;
         }
         log::info!(
@@ -824,7 +837,7 @@ impl Dispatch<WpFractionalScaleV1, ScreenId> for State {
         screen.scale_120 = scale;
         // The buffers are sized in device pixels, so they are the wrong size
         // now.
-        screen.slots = [Slot::EMPTY, Slot::EMPTY];
+        screen.invalidate_buffers();
         screen.update_viewport();
     }
 }
@@ -931,6 +944,29 @@ impl Slot {
     };
 }
 
+fn layout_bounds(screens: impl IntoIterator<Item = Rect>) -> (i32, i32, i32, i32) {
+    let mut bounds: Option<(i32, i32, i32, i32)> = None;
+    for screen in screens
+        .into_iter()
+        .filter(|screen| screen.width > 0 && screen.height > 0)
+    {
+        let (left, top) = (screen.x, screen.y);
+        let (right, bottom) = (left + screen.width, top + screen.height);
+        bounds = Some(match bounds {
+            None => (left, top, right, bottom),
+            Some((x, y, r, b)) => (x.min(left), y.min(top), r.max(right), b.max(bottom)),
+        });
+    }
+    let (x, y, right, bottom) = bounds.unwrap_or((0, 0, 0, 0));
+    (x, y, right - x, bottom - y)
+}
+
+fn invalidate_slots(slots: &mut [Slot; 2]) -> bool {
+    let needs_redraw = slots.iter().any(|slot| slot.last_drawn.is_some());
+    *slots = [Slot::EMPTY, Slot::EMPTY];
+    needs_redraw
+}
+
 fn clear(pixels: &mut [u32], stride: usize, rect: Rect) {
     let rows = pixels.len() / stride;
     for y in rect.y.max(0)..(rect.y + rect.height).max(0) {
@@ -984,7 +1020,7 @@ impl LayerShellHandler for State {
             log::info!("screen {} configured at {}x{}", screen.id.0, size.0, size.1);
             screen.size = size;
             // The old buffers are the wrong size now.
-            screen.slots = [Slot::EMPTY, Slot::EMPTY];
+            screen.invalidate_buffers();
             screen.update_viewport();
         }
         screen.configured = true;
@@ -1106,3 +1142,84 @@ impl ProvidesRegistryState for State {
 
 delegate_dispatch2!(State);
 delegate_registry!(State);
+
+#[cfg(test)]
+mod tests {
+    use super::{Rect, Slot, clear, invalidate_slots, layout_bounds};
+
+    #[test]
+    fn layout_retains_geometry_without_surface_configuration() {
+        let left = Rect {
+            x: -1920,
+            y: -200,
+            width: 1920,
+            height: 1080,
+        };
+        let right = Rect {
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+        };
+        let unknown = Rect {
+            x: -9000,
+            y: -9000,
+            width: 0,
+            height: 0,
+        };
+        assert_eq!(
+            layout_bounds([left, right, unknown]),
+            (-1920, -200, 4480, 1640)
+        );
+        assert_eq!(layout_bounds([right]), (0, 0, 2560, 1440));
+        assert_eq!(layout_bounds([]), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn invalidation_keeps_pending_redraw_across_repeated_changes() {
+        let mut slots = [Slot::EMPTY, Slot::EMPTY];
+        assert!(!invalidate_slots(&mut slots));
+        slots[1].last_drawn = Some(Rect {
+            x: 900,
+            y: 900,
+            width: 32,
+            height: 32,
+        });
+        let mut needs_redraw = invalidate_slots(&mut slots);
+        assert!(needs_redraw);
+        assert!(
+            slots
+                .iter()
+                .all(|slot| slot.buffer.is_none() && slot.last_drawn.is_none())
+        );
+        needs_redraw |= invalidate_slots(&mut slots);
+        assert!(needs_redraw);
+    }
+
+    #[test]
+    fn clearing_clips_to_buffer_edges() {
+        let mut pixels = [1; 12];
+        clear(
+            &mut pixels,
+            4,
+            Rect {
+                x: -2,
+                y: -1,
+                width: 4,
+                height: 3,
+            },
+        );
+        assert_eq!(pixels, [0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1]);
+        clear(
+            &mut pixels,
+            4,
+            Rect {
+                x: 3,
+                y: 2,
+                width: 32,
+                height: 32,
+            },
+        );
+        assert_eq!(pixels[11], 0);
+    }
+}
