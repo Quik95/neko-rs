@@ -280,17 +280,29 @@ impl Overlay {
     /// which is what makes a stale report from a monitor that has since been
     /// unplugged harmless.
     pub fn hide_outputs<S: AsRef<str>>(&mut self, names: &[S]) {
+        // Collected first: showing a screen again rebuilds its surface, which
+        // needs the globals on State while the screens are borrowed.
+        let mut show = Vec::new();
         for screen in &mut self.state.screens {
             let hidden = names.iter().any(|name| name.as_ref() == screen.name);
-            if hidden != screen.hidden {
-                log::debug!(
-                    "screen {} ({}) is now {}",
-                    screen.id.0,
-                    screen.name,
-                    if hidden { "hidden" } else { "visible" }
-                );
-                screen.hidden = hidden;
+            if hidden == screen.hidden {
+                continue;
             }
+            log::debug!(
+                "screen {} ({}) is now {}",
+                screen.id.0,
+                screen.name,
+                if hidden { "hidden" } else { "visible" }
+            );
+            screen.hidden = hidden;
+            if hidden {
+                screen.unmap();
+            } else {
+                show.push(screen.id);
+            }
+        }
+        for id in show {
+            self.state.rebuild_surface(id);
         }
     }
 }
@@ -308,7 +320,7 @@ struct Screen {
     /// `wp_viewporter`, where the buffer has to be logical-sized.
     viewport: Option<WpViewport>,
     /// Held so the preferred scale keeps arriving; never read.
-    _fractional_scale: Option<WpFractionalScaleV1>,
+    fractional_scale: Option<WpFractionalScaleV1>,
     /// The compositor's preferred scale, in 120ths. 120 means 1.0.
     scale_120: u32,
     /// Where this output's top-left sits in the global logical layout.
@@ -327,9 +339,6 @@ struct Screen {
     /// compositor from handing the fullscreen window straight to the display
     /// controller, which is the whole cost we are trying to avoid.
     hidden: bool,
-    /// Whether the null buffer has already been committed, so hiding and
-    /// showing are each done once rather than every frame.
-    unmapped: bool,
 }
 
 impl Screen {
@@ -398,21 +407,11 @@ impl Screen {
         surface.attach(None, 0, 0);
         surface.commit();
         self.slots = [Slot::EMPTY, Slot::EMPTY];
-        self.unmapped = true;
         // An unmapped layer surface is back where it started: attaching a
         // buffer before the compositor has configured it again is a protocol
         // error that kills the connection, so it counts as unconfigured until
         // that configure arrives.
         self.configured = false;
-    }
-
-    /// Asks the compositor to configure the surface again after an unmap.
-    ///
-    /// A commit with no buffer is what starts that round - the same handshake
-    /// the surface went through when it was first created.
-    fn remap(&mut self) {
-        self.layer.wl_surface().commit();
-        self.unmapped = false;
     }
 
     /// Draws the sprite at `(x, y)` in this output's own logical pixels.
@@ -428,19 +427,8 @@ impl Screen {
         x: i32,
         y: i32,
     ) -> Result<()> {
-        if self.hidden {
-            if !self.unmapped {
-                self.unmap();
-            }
-            return Ok(());
-        }
-        if self.unmapped {
-            self.remap();
-            // The configure that remapping asks for arrives on a later
-            // dispatch; until it does there is nothing to draw on.
-            return Ok(());
-        }
-        if !self.configured || self.size.0 <= 0 || self.size.1 <= 0 {
+        // Unmapping and mapping again both happen once, in `hide_outputs`.
+        if self.hidden || !self.configured || self.size.0 <= 0 || self.size.1 <= 0 {
             return Ok(());
         }
         self.ensure_buffers(pool)?;
@@ -590,6 +578,53 @@ impl State {
         let id = ScreenId(self.next_id);
         self.next_id += 1;
 
+        let (layer, viewport, fractional_scale) = self.make_layer(output, id);
+
+        let name = self
+            .outputs
+            .info(output)
+            .and_then(|info| info.name)
+            .unwrap_or_else(|| "?".to_owned());
+        let position = self.position_of(output);
+        log::info!(
+            "covering output {name} at {},{} as screen {}",
+            position.0,
+            position.1,
+            id.0
+        );
+
+        self.screens.push(Screen {
+            id,
+            output: output.clone(),
+            name: name.clone(),
+            layer,
+            viewport,
+            fractional_scale,
+            scale_120: SCALE_DENOMINATOR,
+            position,
+            size: (0, 0),
+            slots: [Slot::EMPTY, Slot::EMPTY],
+            next_slot: 0,
+            configured: false,
+            hidden: false,
+        });
+    }
+
+    /// Builds a fresh overlay surface for one output.
+    ///
+    /// Used both when an output appears and when a screen is shown again after
+    /// being hidden: `KWin` does not answer the bare commit that is supposed to
+    /// start a new configure round on an unmapped layer surface, so the way
+    /// back on screen is a new surface rather than a revived one.
+    fn make_layer(
+        &mut self,
+        output: &wl_output::WlOutput,
+        id: ScreenId,
+    ) -> (
+        LayerSurface,
+        Option<WpViewport>,
+        Option<WpFractionalScaleV1>,
+    ) {
         let surface = self.compositor.create_surface(&self.qh);
         let layer = self.layer_shell.create_layer_surface(
             &self.qh,
@@ -624,35 +659,28 @@ impl State {
                 .map(|manager| manager.get_fractional_scale(layer.wl_surface(), &self.qh, id)),
         );
 
-        let name = self
-            .outputs
-            .info(output)
-            .and_then(|info| info.name)
-            .unwrap_or_else(|| "?".to_owned());
-        let position = self.position_of(output);
-        log::info!(
-            "covering output {name} at {},{} as screen {}",
-            position.0,
-            position.1,
-            id.0
-        );
+        (layer, viewport, fractional_scale)
+    }
 
-        self.screens.push(Screen {
-            id,
-            output: output.clone(),
-            name: name.clone(),
-            layer,
-            viewport,
-            _fractional_scale: fractional_scale,
-            scale_120: SCALE_DENOMINATOR,
-            position,
-            size: (0, 0),
-            slots: [Slot::EMPTY, Slot::EMPTY],
-            next_slot: 0,
-            configured: false,
-            hidden: false,
-            unmapped: false,
-        });
+    /// Replaces a hidden screen's surface with a new one, putting it back on
+    /// screen. The old surface goes away with the value it is swapped out of.
+    fn rebuild_surface(&mut self, id: ScreenId) {
+        let Some(screen) = self.screens.iter().find(|screen| screen.id == id) else {
+            return;
+        };
+        let output = screen.output.clone();
+        let (layer, viewport, fractional_scale) = self.make_layer(&output, id);
+        let Some(screen) = self.screen_mut(id) else {
+            return;
+        };
+        screen.layer = layer;
+        screen.viewport = viewport;
+        screen.fractional_scale = fractional_scale;
+        // Everything below is what the coming configure will fill in again.
+        screen.size = (0, 0);
+        screen.slots = [Slot::EMPTY, Slot::EMPTY];
+        screen.next_slot = 0;
+        screen.configured = false;
     }
 
     fn screen_mut(&mut self, id: ScreenId) -> Option<&mut Screen> {
