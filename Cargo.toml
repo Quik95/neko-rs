@@ -12,6 +12,10 @@ version = "0.1.0"
 edition = "2024"
 license = "EUPL-1.2"
 repository = "https://github.com/quik95/neko-rs"
+# The crates exist to split this binary up, not to be published; saying so keeps
+# `cargo publish` from firing by accident and lets cargo-deny treat them as the
+# private, path-linked crates they are.
+publish = false
 
 [workspace.dependencies]
 neko-core = { path = "crates/neko-core" }
