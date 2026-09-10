@@ -11,14 +11,18 @@ rustPlatform.buildRustPackage {
   pname = "nekors";
   version = (lib.importTOML ../Cargo.toml).workspace.package.version;
 
-  src = lib.cleanSourceWith {
-    src = ../.;
-    # The KWin script and the bitmaps are needed; build outputs and editor
-    # leftovers are not.
-    filter = path: type: let
-      base = baseNameOf path;
-    in
-      !(builtins.elem base ["target" ".devenv" ".direnv" "result"]);
+  src = lib.fileset.toSource {
+    root = ../.;
+    fileset =
+      lib.fileset.intersection
+      (lib.fileset.gitTracked ../.)
+      (lib.fileset.unions [
+        ../Cargo.toml
+        ../Cargo.lock
+        ../LICENSE
+        ../crates
+        ../kwin-script
+      ]);
   };
 
   cargoLock.lockFile = ../Cargo.lock;
