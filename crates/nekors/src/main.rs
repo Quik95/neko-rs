@@ -138,7 +138,7 @@ fn run(args: &Cli) -> Result<()> {
                 // coordinates, which start wherever the leftmost monitor does;
                 // the state machine counts from the top-left of the layout.
                 let origin = overlay.origin();
-                neko.tick((position.0 - origin.0, position.1 - origin.1));
+                neko.tick(relative_cursor(position, origin));
                 // A cursor that has not moved in a long time means the user has
                 // gone away - drop straight to sleep rather than standing there
                 // washing indefinitely.
@@ -178,6 +178,13 @@ fn is_night() -> bool {
     !(6..22).contains(&hour)
 }
 
+fn relative_cursor(position: (i32, i32), origin: (i32, i32)) -> (i32, i32) {
+    (
+        position.0.saturating_sub(origin.0),
+        position.1.saturating_sub(origin.1),
+    )
+}
+
 /// The bounds to hand the state machine.
 ///
 /// It reasons in unscaled 32x32 sprites, but what is drawn is `scale` times
@@ -189,4 +196,18 @@ fn brain_bounds(size: (i32, i32), scale: u32) -> (i32, i32) {
         (size.0 - overhang).max(SPRITE_SIZE),
         (size.1 - overhang).max(SPRITE_SIZE),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_translation_saturates_extreme_coordinates() {
+        assert_eq!(
+            relative_cursor((i32::MAX, i32::MIN), (-1, 1)),
+            (i32::MAX, i32::MIN)
+        );
+        assert_eq!(relative_cursor((-100, 100), (-200, -100)), (100, 200));
+    }
 }
