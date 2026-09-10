@@ -36,7 +36,15 @@
     in {
       default = pkgs.mkShell {
         inputsFrom = [self.packages.${system}.nekors];
-        packages = with pkgs; [clippy rustfmt rust-analyzer];
+        packages = with pkgs; [
+          clippy
+          rustfmt
+          rust-analyzer
+          cargo-deny
+          alejandra
+          actionlint
+          zizmor
+        ];
         RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
       };
     });
