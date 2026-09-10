@@ -237,6 +237,23 @@ impl Overlay {
         (width, height)
     }
 
+    /// Whether a point in global logical coordinates falls on a screen that is
+    /// currently hidden.
+    ///
+    /// A cursor sitting on a fullscreen window is a cursor the animal cannot
+    /// reach: chasing it would leave the cat pressed against the edge of the
+    /// neighbouring monitor for the length of the film.
+    #[must_use]
+    pub fn hidden_at(&self, x: i32, y: i32) -> bool {
+        self.state.screens.iter().any(|screen| {
+            screen.hidden
+                && x >= screen.position.0
+                && y >= screen.position.1
+                && x < screen.position.0 + screen.size.0
+                && y < screen.position.1 + screen.size.1
+        })
+    }
+
     /// True once the compositor has taken every surface away.
     #[must_use]
     pub fn closed(&self) -> bool {

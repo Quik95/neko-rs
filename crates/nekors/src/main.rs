@@ -101,10 +101,28 @@ fn run(args: &Cli) -> Result<()> {
             }
         }
 
+        // Fullscreen windows are the compositor's business too; a Wayland
+        // client cannot see them. The animal keeps walking its usual route
+        // across the layout - it is simply not drawn where a film is. Done
+        // before the cursor is read, so this tick already knows which screens
+        // are off limits.
+        if !args.over_fullscreen {
+            overlay.hide_outputs(&cursor.fullscreen_outputs());
+        }
+
         // --static keeps the animal to itself, so the cursor is never consulted.
-        match cursor.last_position().filter(|_| !args.is_static) {
+        // Neither is a cursor resting on a screen the animal has been kept off:
+        // it cannot be reached, and chasing it would only pin the cat against
+        // the edge of the next monitor for as long as the film lasts.
+        match cursor
+            .last_position()
+            .filter(|_| !args.is_static)
+            .filter(|(position, _)| !overlay.hidden_at(position.0, position.1))
+        {
             None => {
-                if !warned_about_silence && !args.is_static {
+                // Only when nothing has ever arrived: a cursor that is merely
+                // out of reach is not a broken feed.
+                if !warned_about_silence && !args.is_static && cursor.last_position().is_none() {
                     log::warn!(
                         "no cursor position yet - is the nekors KWin script loaded? \
                          try `reload-kwin-script`"
@@ -134,13 +152,6 @@ fn run(args: &Cli) -> Result<()> {
         // sees the keyboard too, and it knows about the lock screen.
         if overlay.session_idle() {
             neko.sleep_now();
-        }
-
-        // Fullscreen windows are the compositor's business too; a Wayland
-        // client cannot see them. The animal keeps walking its usual route
-        // across the layout - it is simply not drawn where a film is.
-        if !args.over_fullscreen {
-            overlay.hide_outputs(&cursor.fullscreen_outputs());
         }
 
         let frame = neko.frame();
