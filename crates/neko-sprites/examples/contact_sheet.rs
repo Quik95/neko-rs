@@ -36,7 +36,7 @@ fn main() {
             &mut canvas,
             i32::try_from(x).expect("in range"),
             i32::try_from(y).expect("in range"),
-            SCALE,
+            (sprite.width * SCALE, sprite.height * SCALE),
             Palette::default(),
         );
         println!("{index:2}: {}", sprite.name);

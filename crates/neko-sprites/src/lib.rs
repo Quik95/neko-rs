@@ -110,32 +110,39 @@ impl Sprite {
         bits[index] >> (x % 8) & 1 == 1
     }
 
-    /// Blits onto `canvas` with its top-left at `(dst_x, dst_y)`, scaled up by
-    /// an integer factor with nearest-neighbour sampling so the 1-bit art stays
-    /// crisp. Pixels outside the canvas are clipped, and anything outside the
-    /// mask is left untouched - the surface stays transparent there.
+    /// Blits onto `canvas` with its top-left at `(dst_x, dst_y)`, stretched to
+    /// `size` with nearest-neighbour sampling so the 1-bit art stays crisp.
+    ///
+    /// A size that is not a whole multiple of the sprite's makes some source
+    /// pixels one device pixel wider than others. That is what keeps the drawn
+    /// animal the requested size under a fractional scale. Pixels outside the
+    /// canvas are clipped, and anything outside the mask is left untouched: the
+    /// surface stays transparent there. A zero size draws nothing.
     pub fn blit_argb(
         &self,
         canvas: &mut Canvas,
         dst_x: i32,
         dst_y: i32,
-        scale: u32,
+        size: (u32, u32),
         palette: Palette,
     ) {
-        assert!(scale > 0, "scale must be positive");
         let stride = (self.width as usize).div_ceil(8);
-        let (dst_x, dst_y, scale) = (i64::from(dst_x), i64::from(dst_y), i64::from(scale));
-        let right = dst_x.saturating_add(i64::from(self.width).saturating_mul(scale));
-        let bottom = dst_y.saturating_add(i64::from(self.height).saturating_mul(scale));
+        let (dst_x, dst_y) = (i64::from(dst_x), i64::from(dst_y));
+        let (target_width, target_height) = (i64::from(size.0), i64::from(size.1));
+        let right = dst_x.saturating_add(target_width);
+        let bottom = dst_y.saturating_add(target_height);
         let width = i64::try_from(canvas.stride).unwrap_or(i64::MAX);
         let height = i64::try_from(canvas.rows()).unwrap_or(i64::MAX);
         let background = premultiply(palette.background);
         let outline = premultiply(palette.outline);
 
+        // The loops are empty for a zero size, so the divisions never see one.
         for dst_row in dst_y.max(0)..bottom.min(height) {
-            let y = u32::try_from((dst_row - dst_y) / scale).unwrap();
+            let y = (dst_row - dst_y) * i64::from(self.height) / target_height;
+            let y = u32::try_from(y).unwrap();
             for dst_column in dst_x.max(0)..right.min(width) {
-                let x = u32::try_from((dst_column - dst_x) / scale).unwrap();
+                let x = (dst_column - dst_x) * i64::from(self.width) / target_width;
+                let x = u32::try_from(x).unwrap();
                 if Self::get(self.mask, stride, x, y) {
                     let colour = if Self::get(self.bits, stride, x, y) {
                         outline
@@ -175,7 +182,7 @@ mod tests {
                 },
                 0,
                 0,
-                1,
+                (2, 1),
                 Palette {
                     background: colour,
                     outline: colour,
@@ -203,7 +210,7 @@ mod tests {
             &mut canvas,
             i32::MAX,
             i32::MAX,
-            u32::MAX,
+            (u32::MAX, u32::MAX),
             Palette::default(),
         );
         assert_eq!(canvas.pixels, &[0; 4]);
@@ -211,7 +218,7 @@ mod tests {
             &mut canvas,
             i32::MIN,
             i32::MIN,
-            u32::MAX,
+            (u32::MAX, u32::MAX),
             Palette::default(),
         );
         assert_eq!(canvas.pixels, &[0xffff_ffff; 4]);
@@ -229,7 +236,7 @@ mod tests {
             &mut canvas,
             0,
             0,
-            u32::MAX,
+            (u32::MAX, u32::MAX),
             Palette::default(),
         );
         assert_eq!(pixels, [7]);
@@ -274,7 +281,7 @@ mod tests {
             pixels: &mut pixels,
             stride: 32,
         };
-        sprite.blit_argb(&mut canvas, 0, 0, 1, Palette::default());
+        sprite.blit_argb(&mut canvas, 0, 0, (32, 32), Palette::default());
 
         let painted = pixels.iter().filter(|&&px| px != 0).count();
         let masked = (0..32)
@@ -293,6 +300,35 @@ mod tests {
             pixels: &mut pixels,
             stride: 16,
         };
-        sprite.blit_argb(&mut canvas, -8, -8, 2, Palette::default());
+        sprite.blit_argb(&mut canvas, -8, -8, (64, 64), Palette::default());
+    }
+
+    /// A 2x1 sprite stretched to 5x3: every target pixel is painted, and the
+    /// uneven split keeps the source pixels in order.
+    #[test]
+    fn fractional_sizes_cover_the_target_in_source_order() {
+        let sprite = Sprite {
+            name: "test",
+            width: 2,
+            height: 1,
+            bits: &[1],
+            mask: &[3],
+        };
+        let mut pixels = [0; 5 * 3];
+        sprite.blit_argb(
+            &mut Canvas {
+                pixels: &mut pixels,
+                stride: 5,
+            },
+            0,
+            0,
+            (5, 3),
+            Palette {
+                background: 0xff00_00ff,
+                outline: 0xffff_0000,
+            },
+        );
+        let (o, b) = (0xffff_0000, 0xff00_00ff);
+        assert_eq!(pixels, [o, o, o, b, b].repeat(3).as_slice());
     }
 }

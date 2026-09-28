@@ -155,7 +155,11 @@ Full list in `nekors --help` and `nekors(1)`; the less obvious ones:
 
 Under a fractional scale the overlay draws at device resolution through
 `wp_viewporter`, so the sprite stays sharp rather than being scaled up by the
-compositor.
+compositor. `--scale` counts logical pixels, so the animal is the same size
+at 120% as at 100%; the 1-bit art is stretched with nearest-neighbour
+sampling, which leaves some of its pixels one device pixel wider than others.
+Compositors without `wp_fractional_scale_v1` or `wp_viewporter` get the
+output's integer scale instead.
 
 ## Licensing
 

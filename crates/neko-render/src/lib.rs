@@ -35,7 +35,7 @@ use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 use wayland_client::globals::{GlobalList, registry_queue_init};
 use wayland_client::protocol::{wl_output, wl_seat, wl_shm, wl_surface};
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle};
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{
     self, ExtIdleNotificationV1,
 };
@@ -101,7 +101,8 @@ pub struct OverlayConfig {
     /// The `wl_output` to confine the animal to, by name (e.g. `"DP-1"`).
     /// `None` spans every output, so it can cross from monitor to monitor.
     pub output: Option<String>,
-    /// Integer upscaling of the 32x32 sprite.
+    /// Integer upscaling of the 32x32 sprite, in logical pixels: the output's
+    /// own scale comes on top.
     pub scale: u32,
     pub palette: Palette,
     /// How long the seat must be idle before [`Overlay::session_idle`] turns
@@ -148,8 +149,8 @@ impl Overlay {
             .and_then(|after| bind_idle_notification(&globals, &qh, after));
 
         // Fractional scaling only pays off if the buffer can be handed over at
-        // device resolution, which needs a viewport; without one, ask for
-        // nothing and let the compositor scale a logical-sized buffer.
+        // device resolution, which needs a viewport; without one, fall back to
+        // the integer scale the compositor reports through wl_surface.
         let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
         let fractional_scales = viewporter.as_ref().and(
             globals
@@ -157,7 +158,9 @@ impl Overlay {
                 .ok(),
         );
         if viewporter.is_none() {
-            log::info!("no wp_viewporter; the compositor will scale the overlay itself");
+            log::info!("no wp_viewporter; drawing at the output's integer scale");
+        } else if fractional_scales.is_none() {
+            log::info!("no wp_fractional_scale_v1; drawing at the output's integer scale");
         }
 
         let pool = SlotPool::new(1, &shm).context("create the shm pool")?;
@@ -331,11 +334,15 @@ struct Screen {
     layer: LayerSurface,
     /// Scales the buffer down to the logical size the surface was given, so we
     /// can hand over real device pixels. `None` on a compositor without
-    /// `wp_viewporter`, where the buffer has to be logical-sized.
+    /// `wp_viewporter`, where `wl_surface.set_buffer_scale` does that job for
+    /// integer scales only.
     viewport: Option<WpViewport>,
-    /// Held so the preferred scale keeps arriving; never read.
+    /// Held so the preferred scale keeps arriving. While there is one, the
+    /// coarser integer scale from `wl_surface` is ignored.
     fractional_scale: Option<WpFractionalScaleV1>,
-    /// The compositor's preferred scale, in 120ths. 120 means 1.0.
+    /// The scale to draw at, in 120ths: 120 means 1.0. From
+    /// `wp_fractional_scale_v1` when there is one, otherwise a whole multiple
+    /// of 120 from the integer scale.
     scale_120: u32,
     /// Where this output's top-left sits in the global logical layout.
     position: (i32, i32),
@@ -376,29 +383,55 @@ impl Screen {
         self.needs_redraw |= invalidate_slots(&mut self.slots);
     }
 
-    /// The compositor's preferred scale as a plain number.
+    /// The scale to draw at as a plain number.
     fn scale_factor(&self) -> f64 {
         f64::from(self.scale_120) / f64::from(SCALE_DENOMINATOR)
     }
 
-    /// The buffer size in real device pixels, which is what we paint into when
-    /// there is a viewport to scale it back down.
+    /// The integer `buffer_scale` for a compositor without a viewport, where
+    /// `scale_120` only ever holds whole multiples of 120.
+    fn buffer_scale(&self) -> i32 {
+        i32::try_from(self.scale_120 / SCALE_DENOMINATOR)
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// The buffer size in real device pixels, which is what we paint into.
     fn device_size(&self) -> (i32, i32) {
-        if self.viewport.is_none() {
-            return self.size;
-        }
         let scale = self.scale_factor();
         let device = |logical: i32| {
             // Rounding up: a buffer a hair too small would leave a gap along
-            // the right or bottom edge.
+            // the right or bottom edge. Integer scales come out exact.
             round((f64::from(logical) * scale).ceil())
         };
         (device(self.size.0), device(self.size.1))
     }
 
-    /// Tells the viewport to squeeze the device-pixel buffer back into the
-    /// logical size the layer surface was configured at.
-    fn update_viewport(&self) {
+    /// Adopts a new scale, in 120ths, from whichever protocol reported it.
+    fn set_scale(&mut self, scale_120: u32) {
+        if scale_120 == self.scale_120 {
+            return;
+        }
+        log::info!(
+            "preferred scale on screen {} is now {:.3}",
+            self.id.0,
+            f64::from(scale_120) / f64::from(SCALE_DENOMINATOR)
+        );
+        self.scale_120 = scale_120;
+        // The buffers are sized in device pixels, so they are the wrong size
+        // now.
+        self.invalidate_buffers();
+        self.update_scaling();
+    }
+
+    /// Tells the compositor how to fit the device-pixel buffer into the logical
+    /// size the layer surface was configured at: through the viewport when
+    /// there is one, otherwise as an integer buffer scale.
+    ///
+    /// Both are pending state, applied with the next buffer - which is always
+    /// one allocated at the new size, since every caller has just invalidated
+    /// the old ones or is about to receive a configure that does.
+    fn update_scaling(&self) {
         // The preferred scale can arrive before the first configure, and a
         // destination of 0x0 is a protocol error rather than a no-op.
         if self.size.0 <= 0 || self.size.1 <= 0 {
@@ -406,6 +439,12 @@ impl Screen {
         }
         if let Some(viewport) = &self.viewport {
             viewport.set_destination(self.size.0, self.size.1);
+            return;
+        }
+        let surface = self.layer.wl_surface();
+        // set_buffer_scale arrived in wl_surface version 3.
+        if surface.version() >= 3 {
+            surface.set_buffer_scale(self.buffer_scale());
         }
     }
 
@@ -466,25 +505,21 @@ impl Screen {
         let (device_width, device_height) = self.device_size();
         let stride = usize::try_from(device_width).expect("non-negative width");
 
-        // Everything below works in device pixels. The sprite is upscaled by a
-        // whole number even so - a 1-bit bitmap resampled by 1.25 turns to mush,
-        // so the animal ends up a few percent off its requested size instead.
+        // Everything below works in device pixels. The sprite is stretched to
+        // the device size of `config.scale` logical pixels per sprite pixel, so
+        // it is the size the state machine reasons with under any scale.
+        // Nearest-neighbour keeps the 1-bit art sharp; the price under a
+        // fractional scale is that some of its pixels are one device pixel
+        // wider than their neighbours.
         let factor = self.scale_factor();
-        let pixel_scale = u32::try_from(round(f64::from(config.scale) * factor))
-            .unwrap_or(1)
-            .max(1);
-        let scale = i32::try_from(pixel_scale).unwrap_or(1);
-        let (x, y) = if self.viewport.is_some() {
-            (round(f64::from(x) * factor), round(f64::from(y) * factor))
-        } else {
-            (x, y)
-        };
-
+        let device = |logical: i32| round(f64::from(logical) * factor);
+        let side =
+            |pixels: u32| device(i32::try_from(pixels * config.scale).expect("sprite fits")).max(1);
         let target = Rect {
-            x,
-            y,
-            width: i32::try_from(sprite.width).expect("sprite fits") * scale,
-            height: i32::try_from(sprite.height).expect("sprite fits") * scale,
+            x: device(x),
+            y: device(y),
+            width: side(sprite.width),
+            height: side(sprite.height),
         };
 
         // With several monitors most of them have nothing to do on most frames:
@@ -542,7 +577,11 @@ impl Screen {
             clear(pixels, stride, previous);
         }
         let mut canvas = Canvas { pixels, stride };
-        sprite.blit_argb(&mut canvas, x, y, pixel_scale, config.palette);
+        let stretch = (
+            u32::try_from(target.width).expect("positive width"),
+            u32::try_from(target.height).expect("positive height"),
+        );
+        sprite.blit_argb(&mut canvas, target.x, target.y, stretch, config.palette);
 
         let surface = self.layer.wl_surface();
         if self.needs_redraw {
@@ -723,7 +762,7 @@ impl State {
         screen.viewport = viewport;
         screen.fractional_scale = fractional_scale;
         screen.scale_120 = SCALE_DENOMINATOR;
-        screen.update_viewport();
+        screen.update_scaling();
         // Everything below is what the coming configure will fill in again.
         screen.needs_redraw = false;
         screen.slots = [Slot::EMPTY, Slot::EMPTY];
@@ -826,19 +865,9 @@ impl Dispatch<WpFractionalScaleV1, ScreenId> for State {
         let Some(screen) = state.screen_mut(*id) else {
             return;
         };
-        if screen.fractional_scale.as_ref() != Some(proxy) || scale == screen.scale_120 {
-            return;
+        if screen.fractional_scale.as_ref() == Some(proxy) {
+            screen.set_scale(scale);
         }
-        log::info!(
-            "preferred scale on screen {} is now {:.3}",
-            id.0,
-            f64::from(scale) / f64::from(SCALE_DENOMINATOR)
-        );
-        screen.scale_120 = scale;
-        // The buffers are sized in device pixels, so they are the wrong size
-        // now.
-        screen.invalidate_buffers();
-        screen.update_viewport();
     }
 }
 
@@ -1021,20 +1050,36 @@ impl LayerShellHandler for State {
             screen.size = size;
             // The old buffers are the wrong size now.
             screen.invalidate_buffers();
-            screen.update_viewport();
+            screen.update_scaling();
         }
         screen.configured = true;
     }
 }
 
 impl CompositorHandler for State {
+    /// The integer scale, from `wl_surface.preferred_buffer_scale` or the
+    /// outputs the surface is on. Only used where `wp_fractional_scale_v1` is
+    /// missing: it is the same scale rounded up, and following it too would
+    /// make the two fight.
     fn scale_factor_changed(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _new_factor: i32,
+        surface: &wl_surface::WlSurface,
+        new_factor: i32,
     ) {
+        let Some(screen) = self
+            .screens
+            .iter_mut()
+            .find(|screen| screen.layer.wl_surface() == surface)
+        else {
+            return;
+        };
+        if screen.fractional_scale.is_some() {
+            return;
+        }
+        let factor = u32::try_from(new_factor).unwrap_or(1).max(1);
+        screen.set_scale(factor * SCALE_DENOMINATOR);
     }
 
     fn transform_changed(
