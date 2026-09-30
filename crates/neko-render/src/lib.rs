@@ -348,11 +348,13 @@ struct Screen {
     position: (i32, i32),
     /// Surface size in logical pixels.
     size: (i32, i32),
-    /// Two buffers, alternated. A single one would never come back: the
-    /// compositor holds an attached buffer until another is attached, so we
-    /// would be waiting for a release that only our own next frame can cause.
-    slots: [Slot; 2],
-    /// Which slot to prefer next frame - the one not currently on screen.
+    /// Buffers taken in turn, allocated only when every existing one is still
+    /// held. A single one would never come back: the compositor holds an
+    /// attached buffer until another is attached. Two are not enough either:
+    /// `KWin` keeps the previous one too until the next commit, so a pair would
+    /// leave every other frame with nothing to draw into.
+    slots: [Slot; SLOTS],
+    /// Which slot to try first next frame - the one committed longest ago.
     next_slot: usize,
     configured: bool,
     needs_redraw: bool,
@@ -448,23 +450,34 @@ impl Screen {
         }
     }
 
-    /// (Re)allocates the shm buffers after a resize.
-    fn ensure_buffers(&mut self, pool: &mut SlotPool) -> Result<()> {
-        let (width, height) = self.device_size();
-        let stride = width * 4;
-        for slot in &mut self.slots {
-            if slot.buffer.is_some() {
+    /// Takes a buffer the compositor has released, allocating one at the
+    /// current size only if every existing buffer is still held. `None` once
+    /// all slots are allocated and busy.
+    fn take_free_buffer(&mut self, pool: &mut SlotPool) -> Result<Option<(usize, Buffer)>> {
+        let order = (0..SLOTS).map(|offset| (self.next_slot + offset) % SLOTS);
+        for index in order.clone() {
+            let Some(buffer) = self.slots[index].buffer.take() else {
                 continue;
+            };
+            if buffer.canvas(pool).is_some() {
+                return Ok(Some((index, buffer)));
             }
-            let (buffer, canvas) = pool
-                .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
-                .context("allocate the shm buffer")?;
-            // A fresh slot may hold whatever the last one did; start transparent.
-            canvas.fill(0);
-            slot.buffer = Some(buffer);
-            slot.last_drawn = None;
+            self.slots[index].buffer = Some(buffer);
         }
-        Ok(())
+        let Some(index) = order
+            .into_iter()
+            .find(|&index| self.slots[index].buffer.is_none())
+        else {
+            return Ok(None);
+        };
+        let (width, height) = self.device_size();
+        let (buffer, canvas) = pool
+            .create_buffer(width, height, width * 4, wl_shm::Format::Argb8888)
+            .context("allocate the shm buffer")?;
+        // A fresh slot may hold whatever the last one did; start transparent.
+        canvas.fill(0);
+        self.slots[index].last_drawn = None;
+        Ok(Some((index, buffer)))
     }
 
     /// Takes the surface off the screen entirely.
@@ -476,7 +489,7 @@ impl Screen {
         let surface = self.layer.wl_surface();
         surface.attach(None, 0, 0);
         surface.commit();
-        self.slots = [Slot::EMPTY, Slot::EMPTY];
+        self.slots = [Slot::EMPTY; SLOTS];
         // An unmapped layer surface is back where it started: attaching a
         // buffer before the compositor has configured it again is a protocol
         // error that kills the connection, so it counts as unconfigured until
@@ -537,42 +550,26 @@ impl Screen {
             return Ok(());
         }
 
-        self.ensure_buffers(pool)?;
-
         // Taken out so the buffer and the pool can be borrowed at once; put
-        // back before returning. The preferred slot is the one not on screen,
-        // but either will do if that one has not been released yet.
-        let mut free = None;
-        for index in [self.next_slot, 1 - self.next_slot] {
-            let Some(buffer) = self.slots[index].buffer.take() else {
-                continue;
-            };
-            if buffer.canvas(pool).is_some() {
-                free = Some((index, buffer));
-                break;
-            }
-            self.slots[index].buffer = Some(buffer);
-        }
-        let Some((index, buffer)) = free else {
-            // Both buffers are still held by the compositor; skip this frame
+        // back before returning.
+        let Some((index, buffer)) = self.take_free_buffer(pool)? else {
+            // Every buffer is still held by the compositor; skip this frame
             // rather than tearing what is on screen.
-            log::debug!("both shm buffers still in use, skipping a frame");
+            log::debug!("all shm buffers still in use, skipping a frame");
             return Ok(());
         };
-        self.next_slot = 1 - index;
+        self.next_slot = (index + 1) % SLOTS;
         let canvas = buffer.canvas(pool).expect("just checked");
         // The pool hands out bytes; the format is Argb8888, so they are pixels.
         let pixels: &mut [u32] = bytemuck::cast_slice_mut(canvas);
 
-        // Only two rectangles ever change: where the sprite was and where it is
-        // going. Repainting a 4K screen eight times a second to move 32 pixels
-        // would be silly.
-        // This buffer still holds what it showed two frames ago, so both stale
-        // rectangles have to go: its own, and the one the visible buffer shows.
-        let stale_rects = [
-            self.slots[index].last_drawn,
-            self.slots[1 - index].last_drawn,
-        ];
+        // Only a few rectangles ever change: where the sprite was and where it
+        // is going. Repainting a 4K screen eight times a second to move 32
+        // pixels would be silly.
+        // This buffer still holds what it showed some frames ago and the one
+        // on screen holds the latest, so every slot's rectangle has to go.
+        let stale_rects: [Option<Rect>; SLOTS] =
+            std::array::from_fn(|slot| self.slots[slot].last_drawn);
         for previous in stale_rects.into_iter().flatten() {
             clear(pixels, stride, previous);
         }
@@ -678,7 +675,7 @@ impl State {
             scale_120: SCALE_DENOMINATOR,
             position,
             size: (0, 0),
-            slots: [Slot::EMPTY, Slot::EMPTY],
+            slots: [Slot::EMPTY; SLOTS],
             next_slot: 0,
             configured: false,
             needs_redraw: false,
@@ -765,7 +762,7 @@ impl State {
         screen.update_scaling();
         // Everything below is what the coming configure will fill in again.
         screen.needs_redraw = false;
-        screen.slots = [Slot::EMPTY, Slot::EMPTY];
+        screen.slots = [Slot::EMPTY; SLOTS];
         screen.next_slot = 0;
         screen.configured = false;
     }
@@ -960,7 +957,7 @@ impl Dispatch<ExtIdleNotificationV1, ()> for State {
     }
 }
 
-/// One of the two buffers, and where the sprite went on it.
+/// One of the buffers, and where the sprite went on it.
 struct Slot {
     buffer: Option<Buffer>,
     last_drawn: Option<Rect>,
@@ -972,6 +969,9 @@ impl Slot {
         last_drawn: None,
     };
 }
+
+/// Buffers per screen; see [`Screen::slots`].
+const SLOTS: usize = 3;
 
 fn layout_bounds(screens: impl IntoIterator<Item = Rect>) -> (i32, i32, i32, i32) {
     let mut bounds: Option<(i32, i32, i32, i32)> = None;
@@ -990,9 +990,9 @@ fn layout_bounds(screens: impl IntoIterator<Item = Rect>) -> (i32, i32, i32, i32
     (x, y, right - x, bottom - y)
 }
 
-fn invalidate_slots(slots: &mut [Slot; 2]) -> bool {
+fn invalidate_slots(slots: &mut [Slot; SLOTS]) -> bool {
     let needs_redraw = slots.iter().any(|slot| slot.last_drawn.is_some());
-    *slots = [Slot::EMPTY, Slot::EMPTY];
+    *slots = [Slot::EMPTY; SLOTS];
     needs_redraw
 }
 
@@ -1190,7 +1190,7 @@ delegate_registry!(State);
 
 #[cfg(test)]
 mod tests {
-    use super::{Rect, Slot, clear, invalidate_slots, layout_bounds};
+    use super::{Rect, SLOTS, Slot, clear, invalidate_slots, layout_bounds};
 
     #[test]
     fn layout_retains_geometry_without_surface_configuration() {
@@ -1222,7 +1222,7 @@ mod tests {
 
     #[test]
     fn invalidation_keeps_pending_redraw_across_repeated_changes() {
-        let mut slots = [Slot::EMPTY, Slot::EMPTY];
+        let mut slots = [Slot::EMPTY; SLOTS];
         assert!(!invalidate_slots(&mut slots));
         slots[1].last_drawn = Some(Rect {
             x: 900,
