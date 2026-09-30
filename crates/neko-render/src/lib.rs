@@ -32,9 +32,12 @@ use smithay_client_toolkit::shell::wlr_layer::{
 };
 use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
+use smithay_client_toolkit::subcompositor::SubcompositorState;
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 use wayland_client::globals::{GlobalList, registry_queue_init};
-use wayland_client::protocol::{wl_output, wl_seat, wl_shm, wl_surface};
+use wayland_client::protocol::{
+    wl_output, wl_seat, wl_shm, wl_subsurface::WlSubsurface, wl_surface,
+};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle};
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{
     self, ExtIdleNotificationV1,
@@ -78,10 +81,17 @@ struct Rect {
 }
 
 impl Rect {
-    /// Whether any pixel of this rectangle lands on a surface `width` x
-    /// `height` - i.e. whether that surface has anything to redraw.
-    fn hits(self, width: i32, height: i32) -> bool {
-        self.x < width && self.y < height && self.x + self.width > 0 && self.y + self.height > 0
+    /// The part of this rectangle inside `other`, if any.
+    fn intersect(self, other: Self) -> Option<Self> {
+        let (left, top) = (self.x.max(other.x), self.y.max(other.y));
+        let right = (self.x + self.width).min(other.x + other.width);
+        let bottom = (self.y + self.height).min(other.y + other.height);
+        (right > left && bottom > top).then_some(Self {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        })
     }
 }
 
@@ -139,6 +149,9 @@ impl Overlay {
 
         let compositor = CompositorState::bind(&globals, &qh)
             .context("compositor does not offer wl_compositor")?;
+        let subcompositor =
+            SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh)
+                .context("compositor does not offer wl_subcompositor")?;
         let layer_shell = LayerShell::bind(&globals, &qh)
             .context("compositor does not offer zwlr_layer_shell_v1")?;
         let shm = Shm::bind(&globals, &qh).context("compositor does not offer wl_shm")?;
@@ -172,6 +185,7 @@ impl Overlay {
             registry: RegistryState::new(&globals),
             qh: qh.clone(),
             compositor,
+            subcompositor,
             layer_shell,
             outputs,
             shm,
@@ -324,7 +338,12 @@ impl Overlay {
     }
 }
 
-/// One output: its surface, its buffers, and where it sits in the layout.
+/// One output: its surface, the sprite on it, and where it sits in the layout.
+///
+/// The layer surface itself only ever holds a transparent backdrop: it is
+/// there to cover the output and to be the parent of `sprite`, a subsurface
+/// just big enough for the animal that is moved around on top of it. That
+/// keeps every buffer that changes a few kilobytes, however big the screen.
 struct Screen {
     id: ScreenId,
     output: wl_output::WlOutput,
@@ -332,9 +351,9 @@ struct Screen {
     /// caller uses to say which screens are covered by a fullscreen window.
     name: String,
     layer: LayerSurface,
-    /// Scales the buffer down to the logical size the surface was given, so we
-    /// can hand over real device pixels. `None` on a compositor without
-    /// `wp_viewporter`, where `wl_surface.set_buffer_scale` does that job for
+    /// Stretches the 1x1 backdrop over the logical size the surface was given.
+    /// `None` on a compositor without `wp_viewporter`, where the backdrop has
+    /// to be as big as the output and `wl_surface.set_buffer_scale` handles
     /// integer scales only.
     viewport: Option<WpViewport>,
     /// Held so the preferred scale keeps arriving. While there is one, the
@@ -348,21 +367,74 @@ struct Screen {
     position: (i32, i32),
     /// Surface size in logical pixels.
     size: (i32, i32),
-    /// Buffers taken in turn, allocated only when every existing one is still
-    /// held. A single one would never come back: the compositor holds an
-    /// attached buffer until another is attached. Two are not enough either:
-    /// `KWin` keeps the previous one too until the next commit, so a pair would
-    /// leave every other frame with nothing to draw into.
-    slots: [Slot; SLOTS],
-    /// Which slot to try first next frame - the one committed longest ago.
-    next_slot: usize,
+    /// The transparent buffer attached to the layer surface. `None` until it
+    /// is (re)attached, which the next draw does.
+    backdrop: Option<Buffer>,
+    sprite: SpriteSurface,
     configured: bool,
-    needs_redraw: bool,
     /// Set while something is fullscreen here. The surface is unmapped rather
     /// than drawn transparent: a mapped overlay, however empty, keeps the
     /// compositor from handing the fullscreen window straight to the display
     /// controller, which is the whole cost we are trying to avoid.
     hidden: bool,
+}
+
+/// The subsurface the animal is drawn on, sized to the part of it that lies on
+/// this output.
+struct SpriteSurface {
+    surface: wl_surface::WlSurface,
+    subsurface: WlSubsurface,
+    /// Scales the device-pixel buffer to the logical size of the sprite; see
+    /// [`Screen::viewport`].
+    viewport: Option<WpViewport>,
+    /// Buffers the compositor may still hold, reused once released. It keeps
+    /// the last two it was given, so drawing never waits on a release: another
+    /// small buffer is allocated instead.
+    buffers: Vec<Buffer>,
+    /// Whether a buffer is attached, i.e. the animal is on this output.
+    shown: bool,
+}
+
+impl SpriteSurface {
+    /// Destroys the protocol objects. The subsurface goes first: destroying
+    /// the surface under a live role object is a protocol error.
+    fn destroy(&self) {
+        if let Some(viewport) = &self.viewport {
+            viewport.destroy();
+        }
+        self.subsurface.destroy();
+        self.surface.destroy();
+    }
+
+    /// A released buffer of exactly `width` x `height`, or a new one. Released
+    /// buffers of another size are dropped on the way. `None` only if the
+    /// compositor is sitting on an absurd number of them.
+    fn take_buffer(
+        &mut self,
+        pool: &mut SlotPool,
+        width: i32,
+        height: i32,
+    ) -> Result<Option<Buffer>> {
+        let stride = width * 4;
+        self.buffers.retain(|buffer| {
+            buffer.canvas(pool).is_none()
+                || (buffer.height() == height && buffer.stride() == stride)
+        });
+        if let Some(index) = self
+            .buffers
+            .iter()
+            .position(|buffer| buffer.canvas(pool).is_some())
+        {
+            return Ok(Some(self.buffers.swap_remove(index)));
+        }
+        if self.buffers.len() >= MAX_SPRITE_BUFFERS {
+            return Ok(None);
+        }
+        let (buffer, _) = pool
+            .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+            .context("allocate the sprite buffer")?;
+        Ok(Some(buffer))
+    }
 }
 
 impl Drop for Screen {
@@ -372,7 +444,10 @@ impl Drop for Screen {
 }
 
 impl Screen {
+    /// Destroys everything hung off the layer surface, which has to happen
+    /// before the layer surface itself goes.
     fn destroy_extensions(&mut self) {
+        self.sprite.destroy();
         if let Some(viewport) = self.viewport.take() {
             viewport.destroy();
         }
@@ -381,8 +456,11 @@ impl Screen {
         }
     }
 
+    /// Drops the buffers sized for the old scale or size. The next draw
+    /// attaches fresh ones.
     fn invalidate_buffers(&mut self) {
-        self.needs_redraw |= invalidate_slots(&mut self.slots);
+        self.backdrop = None;
+        self.sprite.buffers.clear();
     }
 
     /// The scale to draw at as a plain number.
@@ -398,15 +476,9 @@ impl Screen {
             .max(1)
     }
 
-    /// The buffer size in real device pixels, which is what we paint into.
-    fn device_size(&self) -> (i32, i32) {
-        let scale = self.scale_factor();
-        let device = |logical: i32| {
-            // Rounding up: a buffer a hair too small would leave a gap along
-            // the right or bottom edge. Integer scales come out exact.
-            round((f64::from(logical) * scale).ceil())
-        };
-        (device(self.size.0), device(self.size.1))
+    /// A logical coordinate in device pixels.
+    fn device(&self, logical: i32) -> i32 {
+        round(f64::from(logical) * self.scale_factor())
     }
 
     /// Adopts a new scale, in 120ths, from whichever protocol reported it.
@@ -426,13 +498,13 @@ impl Screen {
         self.update_scaling();
     }
 
-    /// Tells the compositor how to fit the device-pixel buffer into the logical
-    /// size the layer surface was configured at: through the viewport when
-    /// there is one, otherwise as an integer buffer scale.
+    /// Tells the compositor how to fit the backdrop into the logical size the
+    /// layer surface was configured at: through the viewport when there is
+    /// one, otherwise as an integer buffer scale.
     ///
-    /// Both are pending state, applied with the next buffer - which is always
-    /// one allocated at the new size, since every caller has just invalidated
-    /// the old ones or is about to receive a configure that does.
+    /// Both are pending state, applied with the next backdrop - which is
+    /// always a fresh one, since every caller has just invalidated the old one
+    /// or is about to receive a configure that does.
     fn update_scaling(&self) {
         // The preferred scale can arrive before the first configure, and a
         // destination of 0x0 is a protocol error rather than a no-op.
@@ -450,34 +522,30 @@ impl Screen {
         }
     }
 
-    /// Takes a buffer the compositor has released, allocating one at the
-    /// current size only if every existing buffer is still held. `None` once
-    /// all slots are allocated and busy.
-    fn take_free_buffer(&mut self, pool: &mut SlotPool) -> Result<Option<(usize, Buffer)>> {
-        let order = (0..SLOTS).map(|offset| (self.next_slot + offset) % SLOTS);
-        for index in order.clone() {
-            let Some(buffer) = self.slots[index].buffer.take() else {
-                continue;
-            };
-            if buffer.canvas(pool).is_some() {
-                return Ok(Some((index, buffer)));
-            }
-            self.slots[index].buffer = Some(buffer);
-        }
-        let Some(index) = order
-            .into_iter()
-            .find(|&index| self.slots[index].buffer.is_none())
-        else {
-            return Ok(None);
+    /// Attaches a transparent buffer to the layer surface, which maps it.
+    /// Never replaced until the size or scale changes, so it never has to
+    /// come back.
+    fn attach_backdrop(&mut self, pool: &mut SlotPool) -> Result<()> {
+        let (width, height) = if self.viewport.is_some() {
+            (1, 1)
+        } else {
+            // Rounding up: a buffer a hair too small would leave a gap along
+            // the right or bottom edge. Integer scales come out exact.
+            let scale = self.scale_factor();
+            let device = |logical: i32| round((f64::from(logical) * scale).ceil());
+            (device(self.size.0), device(self.size.1))
         };
-        let (width, height) = self.device_size();
         let (buffer, canvas) = pool
             .create_buffer(width, height, width * 4, wl_shm::Format::Argb8888)
-            .context("allocate the shm buffer")?;
-        // A fresh slot may hold whatever the last one did; start transparent.
+            .context("allocate the backdrop")?;
         canvas.fill(0);
-        self.slots[index].last_drawn = None;
-        Ok(Some((index, buffer)))
+        let surface = self.layer.wl_surface();
+        buffer
+            .attach_to(surface)
+            .context("attach the backdrop to the surface")?;
+        surface.damage_buffer(0, 0, width, height);
+        self.backdrop = Some(buffer);
+        Ok(())
     }
 
     /// Takes the surface off the screen entirely.
@@ -485,24 +553,24 @@ impl Screen {
     /// A null buffer unmaps a layer surface, which is what actually lets the
     /// compositor scan the fullscreen window out directly; a transparent
     /// buffer would look the same and cost the same as any other overlay.
+    /// The sprite goes with it, being a child of that surface.
     fn unmap(&mut self) {
         let surface = self.layer.wl_surface();
         surface.attach(None, 0, 0);
         surface.commit();
-        self.slots = [Slot::EMPTY; SLOTS];
+        self.backdrop = None;
         // An unmapped layer surface is back where it started: attaching a
         // buffer before the compositor has configured it again is a protocol
         // error that kills the connection, so it counts as unconfigured until
         // that configure arrives.
         self.configured = false;
-        self.needs_redraw = false;
     }
 
     /// Draws the sprite at `(x, y)` in this output's own logical pixels.
     ///
     /// The caller has already translated out of the layout-wide space, so an
     /// animal standing on another monitor simply lands outside this surface and
-    /// is clipped away - and one straddling the edge is drawn half here.
+    /// is not shown here - and one straddling the edge shows its own half here.
     fn draw(
         &mut self,
         pool: &mut SlotPool,
@@ -515,87 +583,103 @@ impl Screen {
         if self.hidden || !self.configured || self.size.0 <= 0 || self.size.1 <= 0 {
             return Ok(());
         }
-        let (device_width, device_height) = self.device_size();
-        let stride = usize::try_from(device_width).expect("non-negative width");
-
-        // Everything below works in device pixels. The sprite is stretched to
-        // the device size of `config.scale` logical pixels per sprite pixel, so
-        // it is the size the state machine reasons with under any scale.
-        // Nearest-neighbour keeps the 1-bit art sharp; the price under a
-        // fractional scale is that some of its pixels are one device pixel
-        // wider than their neighbours.
-        let factor = self.scale_factor();
-        let device = |logical: i32| round(f64::from(logical) * factor);
-        let side =
-            |pixels: u32| device(i32::try_from(pixels * config.scale).expect("sprite fits")).max(1);
-        let target = Rect {
-            x: device(x),
-            y: device(y),
-            width: side(sprite.width),
-            height: side(sprite.height),
+        let logical = |pixels: u32| i32::try_from(pixels * config.scale).expect("sprite fits");
+        let whole = Rect {
+            x,
+            y,
+            width: logical(sprite.width),
+            height: logical(sprite.height),
         };
+        let visible = whole.intersect(Rect {
+            x: 0,
+            y: 0,
+            width: self.size.0,
+            height: self.size.1,
+        });
 
-        // With several monitors most of them have nothing to do on most frames:
-        // the animal is elsewhere and was elsewhere last frame too. Committing
-        // anyway would wake the compositor for every screen eight times a
-        // second to change nothing.
-        let touched = self.needs_redraw
-            || target.hits(device_width, device_height)
-            || self
-                .slots
-                .iter()
-                .filter_map(|slot| slot.last_drawn)
-                .any(|rect| rect.hits(device_width, device_height));
-        if !touched {
-            return Ok(());
+        let mut changed = false;
+        if self.backdrop.is_none() {
+            self.attach_backdrop(pool)?;
+            changed = true;
         }
+        match visible {
+            Some(visible) => changed |= self.draw_sprite(pool, config, sprite, whole, visible)?,
+            // With several monitors most of them have nothing to show on most
+            // frames; committing anyway would wake the compositor for them
+            // eight times a second to change nothing.
+            None if self.sprite.shown => {
+                self.sprite.surface.attach(None, 0, 0);
+                self.sprite.surface.commit();
+                self.sprite.shown = false;
+                changed = true;
+            }
+            None => {}
+        }
+        // The sprite is a synchronised subsurface: its buffer and position
+        // only take effect with this commit, so they always move together.
+        if changed {
+            self.layer.commit();
+        }
+        Ok(())
+    }
 
-        // Taken out so the buffer and the pool can be borrowed at once; put
-        // back before returning.
-        let Some((index, buffer)) = self.take_free_buffer(pool)? else {
-            // Every buffer is still held by the compositor; skip this frame
-            // rather than tearing what is on screen.
-            log::debug!("all shm buffers still in use, skipping a frame");
-            return Ok(());
+    /// Puts the `visible` part of the sprite, which spans `whole`, on the
+    /// subsurface. Both are in this output's logical pixels. Returns whether
+    /// anything was committed.
+    fn draw_sprite(
+        &mut self,
+        pool: &mut SlotPool,
+        config: &OverlayConfig,
+        sprite: &Sprite,
+        whole: Rect,
+        visible: Rect,
+    ) -> Result<bool> {
+        // Everything below works in device pixels, taken from where the
+        // compositor will put the edges, so the buffer lands on whole pixels
+        // unscaled and the 1-bit art stays sharp. The price under a fractional
+        // scale is that some of its pixels are one device pixel wider than
+        // their neighbours.
+        let (left, top) = (self.device(visible.x), self.device(visible.y));
+        let width = (self.device(visible.x + visible.width) - left).max(1);
+        let height = (self.device(visible.y + visible.height) - top).max(1);
+        let Some(buffer) = self.sprite.take_buffer(pool, width, height)? else {
+            log::debug!("every sprite buffer still in use, skipping a frame");
+            return Ok(false);
         };
-        self.next_slot = (index + 1) % SLOTS;
-        let canvas = buffer.canvas(pool).expect("just checked");
+        let canvas = buffer.canvas(pool).expect("a released or fresh buffer");
+        canvas.fill(0);
         // The pool hands out bytes; the format is Argb8888, so they are pixels.
         let pixels: &mut [u32] = bytemuck::cast_slice_mut(canvas);
-
-        // Only a few rectangles ever change: where the sprite was and where it
-        // is going. Repainting a 4K screen eight times a second to move 32
-        // pixels would be silly.
-        // This buffer still holds what it showed some frames ago and the one
-        // on screen holds the latest, so every slot's rectangle has to go.
-        let stale_rects: [Option<Rect>; SLOTS] =
-            std::array::from_fn(|slot| self.slots[slot].last_drawn);
-        for previous in stale_rects.into_iter().flatten() {
-            clear(pixels, stride, previous);
-        }
-        let mut canvas = Canvas { pixels, stride };
+        let stride = usize::try_from(width).expect("positive width");
         let stretch = (
-            u32::try_from(target.width).expect("positive width"),
-            u32::try_from(target.height).expect("positive height"),
+            u32::try_from((self.device(whole.x + whole.width) - self.device(whole.x)).max(1))
+                .expect("positive width"),
+            u32::try_from((self.device(whole.y + whole.height) - self.device(whole.y)).max(1))
+                .expect("positive height"),
         );
-        sprite.blit_argb(&mut canvas, target.x, target.y, stretch, config.palette);
+        sprite.blit_argb(
+            &mut Canvas { pixels, stride },
+            self.device(whole.x) - left,
+            self.device(whole.y) - top,
+            stretch,
+            config.palette,
+        );
 
-        let surface = self.layer.wl_surface();
-        if self.needs_redraw {
-            surface.damage_buffer(0, 0, device_width, device_height);
-        }
-        for rect in stale_rects.into_iter().flatten().chain([target]) {
-            surface.damage_buffer(rect.x, rect.y, rect.width, rect.height);
-        }
-        self.slots[index].last_drawn = Some(target);
-
+        let surface = &self.sprite.surface;
         buffer
             .attach_to(surface)
-            .context("attach the buffer to the surface")?;
-        self.layer.commit();
-        self.needs_redraw = false;
-        self.slots[index].buffer = Some(buffer);
-        Ok(())
+            .context("attach the sprite buffer")?;
+        surface.damage_buffer(0, 0, width, height);
+        if let Some(viewport) = &self.sprite.viewport {
+            viewport.set_destination(visible.width, visible.height);
+        } else if surface.version() >= 3 {
+            surface.set_buffer_scale(self.buffer_scale());
+        }
+        self.sprite.subsurface.set_position(visible.x, visible.y);
+        surface.commit();
+        self.sprite.buffers.push(buffer);
+        self.sprite.shown = true;
+        Ok(true)
     }
 }
 
@@ -603,6 +687,7 @@ struct State {
     registry: RegistryState,
     qh: QueueHandle<State>,
     compositor: CompositorState,
+    subcompositor: SubcompositorState,
     layer_shell: LayerShell,
     outputs: OutputState,
     shm: Shm,
@@ -651,6 +736,7 @@ impl State {
         self.next_id += 1;
 
         let (layer, viewport, fractional_scale) = self.make_layer(output, id);
+        let sprite = self.make_sprite(layer.wl_surface(), id);
 
         let name = self
             .outputs
@@ -675,10 +761,9 @@ impl State {
             scale_120: SCALE_DENOMINATOR,
             position,
             size: (0, 0),
-            slots: [Slot::EMPTY; SLOTS],
-            next_slot: 0,
+            backdrop: None,
+            sprite,
             configured: false,
-            needs_redraw: false,
             hidden: false,
         });
         self.closed = false;
@@ -736,20 +821,45 @@ impl State {
         (layer, viewport, fractional_scale)
     }
 
+    /// Builds the subsurface the animal is drawn on, above `parent`.
+    fn make_sprite(&self, parent: &wl_surface::WlSurface, id: ScreenId) -> SpriteSurface {
+        let (subsurface, surface) = self
+            .subcompositor
+            .create_subsurface(parent.clone(), &self.qh);
+        // A subsurface starts out taking input everywhere it covers, so the
+        // animal would swallow clicks without this.
+        match Region::new(&self.compositor) {
+            Ok(region) => surface.set_input_region(Some(region.wl_region())),
+            Err(error) => log::error!("no input region ({error}); the animal will eat clicks"),
+        }
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|viewporter| viewporter.get_viewport(&surface, &self.qh, id));
+        SpriteSurface {
+            surface,
+            subsurface,
+            viewport,
+            buffers: Vec::new(),
+            shown: false,
+        }
+    }
+
     /// Replaces a hidden screen's surface with a new one, putting it back on
     /// screen.
     ///
     /// Dropping the old `LayerSurface` destroys the role object and the
-    /// `wl_surface` under it, so nothing accumulates there. The viewport and
-    /// the fractional-scale object are plain protocol proxies with no such
-    /// courtesy: they have to be destroyed by hand, or every trip in and out
-    /// of fullscreen would leave a pair of them behind in the compositor.
+    /// `wl_surface` under it, so nothing accumulates there. The sprite, the
+    /// viewport and the fractional-scale object are plain protocol proxies
+    /// with no such courtesy: they have to be destroyed by hand, or every trip
+    /// in and out of fullscreen would leave them behind in the compositor.
     fn rebuild_surface(&mut self, id: ScreenId) {
         let Some(screen) = self.screens.iter().find(|screen| screen.id == id) else {
             return;
         };
         let output = screen.output.clone();
         let (layer, viewport, fractional_scale) = self.make_layer(&output, id);
+        let sprite = self.make_sprite(layer.wl_surface(), id);
         let Some(screen) = self.screen_mut(id) else {
             return;
         };
@@ -758,12 +868,11 @@ impl State {
         screen.layer = layer;
         screen.viewport = viewport;
         screen.fractional_scale = fractional_scale;
+        screen.sprite = sprite;
         screen.scale_120 = SCALE_DENOMINATOR;
         screen.update_scaling();
         // Everything below is what the coming configure will fill in again.
-        screen.needs_redraw = false;
-        screen.slots = [Slot::EMPTY; SLOTS];
-        screen.next_slot = 0;
+        screen.backdrop = None;
         screen.configured = false;
     }
 
@@ -957,22 +1066,6 @@ impl Dispatch<ExtIdleNotificationV1, ()> for State {
     }
 }
 
-/// One of the buffers, and where the sprite went on it.
-struct Slot {
-    buffer: Option<Buffer>,
-    last_drawn: Option<Rect>,
-}
-
-impl Slot {
-    const EMPTY: Self = Self {
-        buffer: None,
-        last_drawn: None,
-    };
-}
-
-/// Buffers per screen; see [`Screen::slots`].
-const SLOTS: usize = 3;
-
 fn layout_bounds(screens: impl IntoIterator<Item = Rect>) -> (i32, i32, i32, i32) {
     let mut bounds: Option<(i32, i32, i32, i32)> = None;
     for screen in screens
@@ -990,30 +1083,9 @@ fn layout_bounds(screens: impl IntoIterator<Item = Rect>) -> (i32, i32, i32, i32
     (x, y, right - x, bottom - y)
 }
 
-fn invalidate_slots(slots: &mut [Slot; SLOTS]) -> bool {
-    let needs_redraw = slots.iter().any(|slot| slot.last_drawn.is_some());
-    *slots = [Slot::EMPTY; SLOTS];
-    needs_redraw
-}
-
-fn clear(pixels: &mut [u32], stride: usize, rect: Rect) {
-    let rows = pixels.len() / stride;
-    for y in rect.y.max(0)..(rect.y + rect.height).max(0) {
-        let Ok(y) = usize::try_from(y) else { continue };
-        if y >= rows {
-            break;
-        }
-        let start = rect.x.max(0);
-        let end = (rect.x + rect.width).max(0);
-        for x in start..end {
-            let Ok(x) = usize::try_from(x) else { continue };
-            if x >= stride {
-                break;
-            }
-            pixels[y * stride + x] = 0;
-        }
-    }
-}
+/// Sprite buffers per screen before a frame is skipped instead. The compositor
+/// holds two; anything past that means it has stopped releasing them.
+const MAX_SPRITE_BUFFERS: usize = 4;
 
 impl LayerShellHandler for State {
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
@@ -1190,7 +1262,7 @@ delegate_registry!(State);
 
 #[cfg(test)]
 mod tests {
-    use super::{Rect, SLOTS, Slot, clear, invalidate_slots, layout_bounds};
+    use super::{Rect, layout_bounds};
 
     #[test]
     fn layout_retains_geometry_without_surface_configuration() {
@@ -1221,50 +1293,32 @@ mod tests {
     }
 
     #[test]
-    fn invalidation_keeps_pending_redraw_across_repeated_changes() {
-        let mut slots = [Slot::EMPTY; SLOTS];
-        assert!(!invalidate_slots(&mut slots));
-        slots[1].last_drawn = Some(Rect {
-            x: 900,
-            y: 900,
+    fn intersection_keeps_only_the_overlap() {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let straddling = Rect {
+            x: 1900,
+            y: -10,
             width: 32,
             height: 32,
-        });
-        let mut needs_redraw = invalidate_slots(&mut slots);
-        assert!(needs_redraw);
-        assert!(
-            slots
-                .iter()
-                .all(|slot| slot.buffer.is_none() && slot.last_drawn.is_none())
+        };
+        assert_eq!(
+            straddling.intersect(screen),
+            Some(Rect {
+                x: 1900,
+                y: 0,
+                width: 20,
+                height: 22,
+            })
         );
-        needs_redraw |= invalidate_slots(&mut slots);
-        assert!(needs_redraw);
-    }
-
-    #[test]
-    fn clearing_clips_to_buffer_edges() {
-        let mut pixels = [1; 12];
-        clear(
-            &mut pixels,
-            4,
-            Rect {
-                x: -2,
-                y: -1,
-                width: 4,
-                height: 3,
-            },
-        );
-        assert_eq!(pixels, [0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1]);
-        clear(
-            &mut pixels,
-            4,
-            Rect {
-                x: 3,
-                y: 2,
-                width: 32,
-                height: 32,
-            },
-        );
-        assert_eq!(pixels[11], 0);
+        let touching = Rect {
+            x: 1920,
+            ..straddling
+        };
+        assert_eq!(touching.intersect(screen), None);
     }
 }
