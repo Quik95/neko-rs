@@ -5,9 +5,9 @@ version: 'v0.0.3'
 workflows:
     '.github/workflows/ci.yml':
         - 'actions/checkout@v7.0.1'
-        - 'cachix/install-nix-action@v31.11.1'
+        - 'cachix/install-nix-action@v31.11.3'
         - 'nix-community/cache-nix-action@v7.0.2'
-        - 'swatinem/rust-cache@v2.9.2'
+        - 'swatinem/rust-cache@v2.9.3'
     '.github/workflows/release.yml': []
 dependencies:
     'actions/checkout@v7.0.1':
@@ -15,9 +15,9 @@ dependencies:
         commit: 'sha1-3d3c42e5aac5ba805825da76410c181273ba90b1'
         owner_id: 44036562
         repo_id: 197814629
-    'cachix/install-nix-action@v31.11.1':
-        ref: 'v31.11.1'
-        commit: 'sha1-13d8dd58da0234aa297dedd986986ccb8e7f3e24'
+    'cachix/install-nix-action@v31.11.3':
+        ref: 'v31.11.3'
+        commit: 'sha1-75c75c31ebece974e48ebc36b4ad125bd97bd97b'
         owner_id: 36824654
         repo_id: 212301524
     'nix-community/cache-nix-action@v7.0.2':
@@ -25,8 +25,8 @@ dependencies:
         commit: 'sha1-7df957e333c1e5da7721f60227dbba6d06080569'
         owner_id: 33221035
         repo_id: 660071037
-    'swatinem/rust-cache@v2.9.2':
-        ref: 'v2.9.2'
-        commit: 'sha1-6323deb102c322ba6fcbdcafc7e3dddab59af2b6'
+    'swatinem/rust-cache@v2.9.3':
+        ref: 'v2.9.3'
+        commit: 'sha1-d1527c8f67ef9af357290475d4af4b0fab8f12e0'
         owner_id: 580492
         repo_id: 298565987
