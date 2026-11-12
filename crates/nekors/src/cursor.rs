@@ -4,7 +4,8 @@
 //! A trait rather than a concrete D-Bus type, so an evdev or Hyprland source
 //! can be dropped in later without the rest of the program noticing.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -87,46 +88,62 @@ impl CursorService {
 }
 
 /// A cursor source fed by the `KWin` script over the session bus.
+///
+/// The connection lives on a thread of its own: zbus only dispatches incoming
+/// calls while a thread sits in `zbus::block_on`, and the main thread is busy
+/// with the Wayland loop. That thread parks for the rest of the process, so
+/// the bus name stays claimed until exit.
 pub struct DbusCursor {
     latest: Arc<Mutex<Option<Latest>>>,
     fullscreen: Arc<Mutex<Vec<String>>>,
-    /// Held so the bus name stays claimed for as long as we run.
-    _connection: zbus::blocking::Connection,
 }
 
 impl DbusCursor {
     pub fn new() -> Result<Self> {
         let latest = Arc::new(Mutex::new(None));
         let fullscreen = Arc::new(Mutex::new(Vec::new()));
-        let connection = zbus::blocking::connection::Builder::session()
-            .context("connect to the session bus")?
-            .serve_at(
-                PATH,
-                CursorService {
-                    latest: Arc::clone(&latest),
-                },
-            )
-            .context("serve the cursor object")?
-            .serve_at(
-                WINDOWS_PATH,
-                WindowsService {
-                    fullscreen: Arc::clone(&fullscreen),
-                },
-            )
-            .context("serve the windows object")?
-            // Take the name outright rather than queueing behind a stale
-            // instance: a queued nekors would sit there receiving nothing.
-            .name(SERVICE)
-            .with_context(|| format!("claim {SERVICE}"))?
-            .build()
-            .context("start the D-Bus server")?;
+        let cursor = CursorService {
+            latest: Arc::clone(&latest),
+        };
+        let windows = WindowsService {
+            fullscreen: Arc::clone(&fullscreen),
+        };
+
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("nekors-dbus".into())
+            .spawn(move || {
+                zbus::block_on(async move {
+                    let built = zbus::connection::Builder::session()
+                        .serve_at(PATH, cursor)
+                        .serve_at(WINDOWS_PATH, windows)
+                        // Take the name outright rather than queueing behind a
+                        // stale instance: a queued nekors would sit there
+                        // receiving nothing.
+                        .name(SERVICE)
+                        .build()
+                        .await;
+                    match built {
+                        Ok(_connection) => {
+                            // The receiver only goes away if `new` has already
+                            // returned, and then nobody is left to tell.
+                            let _ = ready_tx.send(Ok(()));
+                            std::future::pending::<()>().await;
+                        }
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error));
+                        }
+                    }
+                });
+            })
+            .context("spawn the D-Bus thread")?;
+        ready_rx
+            .recv()
+            .context("the D-Bus thread exited without reporting")?
+            .with_context(|| format!("serve {SERVICE} on the session bus"))?;
 
         log::info!("listening on {SERVICE} {PATH} and {WINDOWS_PATH}");
-        Ok(Self {
-            latest,
-            fullscreen,
-            _connection: connection,
-        })
+        Ok(Self { latest, fullscreen })
     }
 }
 
