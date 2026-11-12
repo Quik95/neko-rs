@@ -3,11 +3,11 @@
     "devenv": {
       "locked": {
         "dir": "src/modules",
-        "lastModified": 1788956372,
-        "narHash": "sha256-ACop98BNBAWic+KLXd5PBSwzxzMUfEWmefVXDBDFyHQ=",
+        "lastModified": 1794505935,
+        "narHash": "sha256-V9kPRUmASiEPPDEQ1rlqoRZbJKVAAhWT+CSs62Eto/s=",
         "owner": "cachix",
         "repo": "devenv",
-        "rev": "2a399e9ea5e981f225d75b25c8fa8d76f730131d",
+        "rev": "9eaaab8d32d853b30823f56997ec3d7c106c358c",
         "type": "github"
       },
       "original": {
@@ -41,11 +41,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1788267358,
-        "narHash": "sha256-nt+lUqYVpc9Y6JeMd2WmXzCDojasdadKo0mWcluvY2Y=",
+        "lastModified": 1793686154,
+        "narHash": "sha256-Zb/0L3soxrkfcrywpfp0J++0WFLB3tzh0Xtx9up+VNc=",
         "owner": "cachix",
         "repo": "git-hooks.nix",
-        "rev": "27555e2624241fb116b49095df4caaee85a25691",
+        "rev": "204b6977e00caac19e2313015a598543ca7be150",
         "type": "github"
       },
       "original": {
@@ -85,11 +85,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1788938153,
-        "narHash": "sha256-czAKV0qN7TtdlGIREdDAJmoATGH0lfF7wNO8OMVToCw=",
+        "lastModified": 1794476126,
+        "narHash": "sha256-KBjfmgZIUqBpjsemRKp4GvrCf8DlNsldkmxphh4X9oo=",
         "owner": "oxalica",
         "repo": "rust-overlay",
-        "rev": "5280ed136f4359ce3f977b0c4c4dab6a34254201",
+        "rev": "d1e30fd696e1151603aa8adaa8f6b8c604fe3eb0",
         "type": "github"
       },
       "original": {
