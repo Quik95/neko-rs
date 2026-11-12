@@ -10,13 +10,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
-/// The D-Bus name the `KWin` script pushes to.
-const SERVICE: &str = "org.nekors.Cursor";
-const PATH: &str = "/Cursor";
+const SERVICE: &str = "io.github.quik95.Nekors";
+const PATH: &str = "/io/github/quik95/Nekors/Cursor";
 /// Second object on the same name, for what the compositor knows about
 /// windows. Kept apart from the cursor so a source that can only supply one of
 /// the two does not have to pretend to serve the other.
-const WINDOWS_PATH: &str = "/Windows";
+const WINDOWS_PATH: &str = "/io/github/quik95/Nekors/Windows";
 
 /// Anything that can say which outputs are covered by a fullscreen window.
 pub trait FullscreenSource {
@@ -51,7 +50,7 @@ struct WindowsService {
     fullscreen: Arc<Mutex<Vec<String>>>,
 }
 
-#[zbus::interface(name = "org.nekors.Windows")]
+#[zbus::interface(name = "io.github.quik95.Nekors.Windows")]
 impl WindowsService {
     /// Reports which outputs currently show a fullscreen window.
     ///
@@ -75,7 +74,7 @@ impl WindowsService {
     }
 }
 
-#[zbus::interface(name = "org.nekors.Cursor")]
+#[zbus::interface(name = "io.github.quik95.Nekors.Cursor")]
 impl CursorService {
     /// Reports the global cursor position, in logical screen pixels.
     fn set_pos(&self, x: i32, y: i32) {

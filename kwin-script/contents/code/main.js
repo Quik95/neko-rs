@@ -9,13 +9,13 @@
 // X11 path - so this polls instead. Polling is cheap as long as we do not talk
 // to D-Bus when nothing has moved, which is most of the time.
 
-const SERVICE = "org.nekors.Cursor";
-const PATH = "/Cursor";
-const INTERFACE = "org.nekors.Cursor";
+const SERVICE = "io.github.quik95.Nekors";
+const PATH = "/io/github/quik95/Nekors/Cursor";
+const INTERFACE = "io.github.quik95.Nekors.Cursor";
 
 // The other half of the feed: which screens are showing a fullscreen window.
-const WINDOWS_PATH = "/Windows";
-const WINDOWS_INTERFACE = "org.nekors.Windows";
+const WINDOWS_PATH = "/io/github/quik95/Nekors/Windows";
+const WINDOWS_INTERFACE = "io.github.quik95.Nekors.Windows";
 
 // ~30 Hz. nekors only thinks eight times a second, but sampling faster keeps
 // the position it thinks with fresh.
