@@ -39,7 +39,7 @@ use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_han
 use wayland_client::backend::WaylandError;
 use wayland_client::globals::{GlobalList, registry_queue_init};
 use wayland_client::protocol::{
-    wl_output, wl_seat, wl_shm, wl_subsurface::WlSubsurface, wl_surface,
+    wl_buffer, wl_output, wl_seat, wl_shm, wl_subsurface::WlSubsurface, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle};
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{
@@ -54,11 +54,22 @@ use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_man
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::{
     self, WpFractionalScaleV1,
 };
+use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::{
+    self, WpSinglePixelBufferManagerV1,
+};
 use wayland_protocols::wp::viewporter::client::wp_viewport::{self, WpViewport};
 use wayland_protocols::wp::viewporter::client::wp_viewporter::{self, WpViewporter};
 
 /// The unit `wp_fractional_scale_v1` reports in: 120ths of a scale factor.
 const SCALE_DENOMINATOR: u32 = 120;
+
+/// Initial size of the SHM pool in bytes, large enough for typical sprite
+/// buffers without immediate `ftruncate` / `wl_shm_pool.resize` churn.
+const INITIAL_SHM_POOL_SIZE: usize = 64 * 1024;
+
+/// Maximum number of Wayland roundtrips to wait for all initial layer surfaces
+/// to configure before starting with whichever ones have already responded.
+const INITIAL_CONFIGURE_ROUNDTRIPS: usize = 3;
 
 /// Rounds a scaled pixel count back to a whole pixel.
 ///
@@ -175,19 +186,26 @@ impl Overlay {
                 .ok()
                 .map(OwnedFractionalScaleManager)
         });
+        let single_pixel_buffer_manager = viewporter.as_ref().and_then(|_| {
+            globals
+                .bind::<WpSinglePixelBufferManagerV1, _, _>(&qh, 1..=1, ())
+                .ok()
+                .map(OwnedSinglePixelBufferManager)
+        });
         if viewporter.is_none() {
             log::info!("no wp_viewporter; drawing at the output's integer scale");
         } else if fractional_scales.is_none() {
             log::info!("no wp_fractional_scale_v1; drawing at the output's integer scale");
         }
 
-        let pool = SlotPool::new(1, &shm).context("create the shm pool")?;
+        let pool = SlotPool::new(INITIAL_SHM_POOL_SIZE, &shm).context("create the shm pool")?;
         let state = State {
             _idle_monitor: idle_monitor,
             session_idle: false,
             screens: Vec::new(),
             viewporter,
             fractional_scales,
+            single_pixel_buffer_manager,
             registry: RegistryState::new(&globals),
             qh: qh.clone(),
             compositor,
@@ -225,14 +243,31 @@ impl Overlay {
             }
         }
 
-        // A surface is not usable until the compositor has told us how big it
-        // is, which it does in response to the commits above. One is enough to
-        // start drawing; the others join as they are configured.
-        while !overlay.state.any_configured() && !overlay.state.closed {
+        // Wait for every initial surface to configure so `origin()` and
+        // `size()` cover the full monitor layout from the very first frame.
+        // Bounded to a few roundtrips so a compositor that never answers one
+        // surface cannot hang startup; late configures still join in `dispatch`.
+        for _ in 0..INITIAL_CONFIGURE_ROUNDTRIPS {
+            if overlay.state.all_configured() || overlay.state.closed {
+                break;
+            }
             overlay
                 .event_queue
-                .blocking_dispatch(&mut overlay.state)
-                .context("waiting for the first layer surface configure")?;
+                .roundtrip(&mut overlay.state)
+                .context("waiting for layer surfaces to configure")?;
+        }
+        if !overlay.state.all_configured() && !overlay.state.closed {
+            let configured = overlay
+                .state
+                .screens
+                .iter()
+                .filter(|screen| screen.surface.as_ref().is_some_and(|s| s.configured))
+                .count();
+            log::warn!(
+                "only {configured}/{} layer surface(s) configured after \
+                 {INITIAL_CONFIGURE_ROUNDTRIPS} roundtrips; continuing anyway",
+                overlay.state.screens.len(),
+            );
         }
         Ok(overlay)
     }
@@ -394,6 +429,33 @@ impl Drop for OwnedFractionalScaleManager {
     }
 }
 
+struct OwnedSinglePixelBufferManager(WpSinglePixelBufferManagerV1);
+
+impl Drop for OwnedSinglePixelBufferManager {
+    fn drop(&mut self) {
+        self.0.destroy();
+    }
+}
+
+struct SinglePixelBuffer;
+
+struct OwnedWlBuffer(wl_buffer::WlBuffer);
+
+impl Drop for OwnedWlBuffer {
+    fn drop(&mut self) {
+        self.0.destroy();
+    }
+}
+
+#[expect(
+    dead_code,
+    reason = "variants are held for Drop to keep the attached buffer alive"
+)]
+enum Backdrop {
+    SinglePixel(OwnedWlBuffer),
+    Shm(Buffer),
+}
+
 struct OwnedViewport(WpViewport);
 
 impl Drop for OwnedViewport {
@@ -451,8 +513,11 @@ struct ScreenSurface {
     layer: LayerSurface,
     /// The transparent buffer attached to the layer surface. `None` until it
     /// is (re)attached, which the next draw does.
-    backdrop: Option<Buffer>,
+    backdrop: Option<Backdrop>,
     configured: bool,
+    /// Set on every `configure` so the next draw commits `ack_configure` even
+    /// when the size, backdrop and sprite are unchanged.
+    needs_commit: bool,
 }
 
 /// One output: its live surface (when not hidden) and where it sits in the
@@ -622,34 +687,92 @@ fn integer_buffer_scale(scale_120: u32) -> i32 {
         .max(1)
 }
 
+/// Scale to render at, falling back to 1.0x when neither `wp_viewporter` nor
+/// `wl_surface.set_buffer_scale` (v3+) is available.
+const fn effective_scale_120(scale_120: u32, has_viewport: bool, surface_version: u32) -> u32 {
+    if !has_viewport && surface_version < 3 {
+        SCALE_DENOMINATOR
+    } else {
+        scale_120
+    }
+}
+
+/// Initial scale in 120ths derived from `wl_output`'s integer scale factor,
+/// before `wp_fractional_scale_v1` reports a preferred scale.
+fn initial_scale_120(scale_factor: Option<i32>) -> u32 {
+    scale_factor
+        .and_then(|factor| u32::try_from(factor).ok())
+        .unwrap_or(1)
+        .max(1)
+        .saturating_mul(SCALE_DENOMINATOR)
+}
+
+/// Marks a surface as damaged using `damage_buffer` (`wl_surface` v4+) when
+/// supported, falling back to logical `damage` on older compositors.
+fn damage_surface(
+    surface: &wl_surface::WlSurface,
+    buf_w: i32,
+    buf_h: i32,
+    logical_w: i32,
+    logical_h: i32,
+) {
+    if surface.version() >= 4 {
+        surface.damage_buffer(0, 0, buf_w, buf_h);
+    } else {
+        surface.damage(0, 0, logical_w, logical_h);
+    }
+}
+
+struct DrawContext<'a> {
+    pool: &'a mut SlotPool,
+    single_pixel_buffer_manager: Option<&'a OwnedSinglePixelBufferManager>,
+    qh: &'a QueueHandle<State>,
+    config: &'a OverlayConfig,
+}
+
 impl ScreenSurface {
     /// Attaches a transparent buffer to the layer surface, which maps it.
-    /// Never replaced until the size or scale changes, so it never has to
-    /// come back.
+    /// Never replaced until the size or scale changes (and with a viewport,
+    /// kept across both).
     fn attach_backdrop(
         &mut self,
-        pool: &mut SlotPool,
+        ctx: &mut DrawContext<'_>,
         size: (i32, i32),
-        scale_factor: f64,
+        scale_120: u32,
     ) -> Result<()> {
+        let surface = self.layer.wl_surface();
+        if self.viewport.is_some()
+            && let Some(manager) = ctx.single_pixel_buffer_manager
+        {
+            let buffer = manager
+                .0
+                .create_u32_rgba_buffer(0, 0, 0, 0, ctx.qh, SinglePixelBuffer);
+            surface.attach(Some(&buffer), 0, 0);
+            damage_surface(surface, 1, 1, size.0, size.1);
+            self.backdrop = Some(Backdrop::SinglePixel(OwnedWlBuffer(buffer)));
+            return Ok(());
+        }
+
         let (width, height) = if self.viewport.is_some() {
             (1, 1)
         } else {
+            let effective_scale = effective_scale_120(scale_120, false, surface.version());
+            let scale_factor = f64::from(effective_scale) / f64::from(SCALE_DENOMINATOR);
             // Rounding up: a buffer a hair too small would leave a gap along
             // the right or bottom edge. Integer scales come out exact.
             let device = |logical: i32| round((f64::from(logical) * scale_factor).ceil());
             (device(size.0), device(size.1))
         };
-        let (buffer, canvas) = pool
+        let (buffer, canvas) = ctx
+            .pool
             .create_buffer(width, height, width * 4, wl_shm::Format::Argb8888)
             .context("allocate the backdrop")?;
         canvas.fill(0);
-        let surface = self.layer.wl_surface();
         buffer
             .attach_to(surface)
             .context("attach the backdrop to the surface")?;
-        surface.damage_buffer(0, 0, width, height);
-        self.backdrop = Some(buffer);
+        damage_surface(surface, width, height, size.0, size.1);
+        self.backdrop = Some(Backdrop::Shm(buffer));
         Ok(())
     }
 
@@ -658,8 +781,7 @@ impl ScreenSurface {
     /// anything was committed.
     fn draw_sprite(
         &mut self,
-        pool: &mut SlotPool,
-        config: &OverlayConfig,
+        ctx: &mut DrawContext<'_>,
         sprite: &Sprite,
         whole: Rect,
         visible: Rect,
@@ -674,15 +796,18 @@ impl ScreenSurface {
             return Ok(false);
         }
 
+        let surface_version = self.sprite.surface.wl_surface().version();
+        let effective_scale =
+            effective_scale_120(scale_120, self.sprite.viewport.is_some(), surface_version);
         // Size the buffer directly from the rectangle dimensions rather than
         // rounded screen edges so moving under a fractional scale does not
         // jitter the buffer size by ±1 device pixel and thrash allocations.
-        let geom = sprite_geometry(whole, visible, scale_120);
-        let Some(buffer) = self.sprite.take_buffer(pool, geom.width, geom.height)? else {
+        let geom = sprite_geometry(whole, visible, effective_scale);
+        let Some(buffer) = self.sprite.take_buffer(ctx.pool, geom.width, geom.height)? else {
             log::debug!("every sprite buffer still in use, skipping a frame");
             return Ok(false);
         };
-        let canvas = buffer.canvas(pool).expect("a released or fresh buffer");
+        let canvas = buffer.canvas(ctx.pool).expect("a released or fresh buffer");
         canvas.fill(0);
         // The pool hands out bytes; the format is Argb8888, so they are pixels.
         let pixels: &mut [u32] = bytemuck::cast_slice_mut(canvas);
@@ -692,18 +817,24 @@ impl ScreenSurface {
             geom.dst_x,
             geom.dst_y,
             geom.stretch,
-            config.palette,
+            ctx.config.palette,
         );
 
         let surface = self.sprite.surface.wl_surface();
         buffer
             .attach_to(surface)
             .context("attach the sprite buffer")?;
-        surface.damage_buffer(0, 0, geom.width, geom.height);
+        damage_surface(
+            surface,
+            geom.width,
+            geom.height,
+            visible.width,
+            visible.height,
+        );
         if let Some(viewport) = &self.sprite.viewport {
             viewport.0.set_destination(visible.width, visible.height);
         } else if surface.version() >= 3 {
-            surface.set_buffer_scale(integer_buffer_scale(scale_120));
+            surface.set_buffer_scale(integer_buffer_scale(effective_scale));
         }
         self.sprite.subsurface.0.set_position(visible.x, visible.y);
         surface.commit();
@@ -714,23 +845,15 @@ impl ScreenSurface {
 }
 
 impl Screen {
-    /// Drops the buffers sized for the old scale or size. The next draw
-    /// attaches fresh ones.
-    fn invalidate_buffers(&mut self) {
-        if let Some(surface) = &mut self.surface {
-            surface.backdrop = None;
-            surface.sprite.buffers.clear();
-            surface.sprite.cache.invalidate();
-        }
-    }
-
-    /// The scale to draw at as a plain number.
-    fn scale_factor(&self) -> f64 {
-        f64::from(self.scale_120) / f64::from(SCALE_DENOMINATOR)
-    }
-
     /// Adopts a new scale, in 120ths, from whichever protocol reported it.
     fn set_scale(&mut self, scale_120: u32) {
+        let scale_120 = self.surface.as_ref().map_or(scale_120, |surface| {
+            effective_scale_120(
+                scale_120,
+                surface.viewport.is_some(),
+                surface.layer.wl_surface().version(),
+            )
+        });
         if scale_120 == self.scale_120 {
             return;
         }
@@ -740,9 +863,13 @@ impl Screen {
             f64::from(scale_120) / f64::from(SCALE_DENOMINATOR)
         );
         self.scale_120 = scale_120;
-        // The buffers are sized in device pixels, so they are the wrong size
-        // now.
-        self.invalidate_buffers();
+        if let Some(surface) = &mut self.surface {
+            if surface.viewport.is_none() {
+                surface.backdrop = None;
+            }
+            surface.sprite.buffers.clear();
+            surface.sprite.cache.invalidate();
+        }
         self.update_scaling();
     }
 
@@ -750,9 +877,7 @@ impl Screen {
     /// layer surface was configured at: through the viewport when there is
     /// one, otherwise as an integer buffer scale.
     ///
-    /// Both are pending state, applied with the next backdrop - which is
-    /// always a fresh one, since every caller has just invalidated the old one
-    /// or is about to receive a configure that does.
+    /// Both are pending state, applied on the next commit.
     fn update_scaling(&self) {
         let Some(screen_surface) = &self.surface else {
             return;
@@ -778,16 +903,8 @@ impl Screen {
     /// The caller has already translated out of the layout-wide space, so an
     /// animal standing on another monitor simply lands outside this surface and
     /// is not shown here - and one straddling the edge shows its own half here.
-    fn draw(
-        &mut self,
-        pool: &mut SlotPool,
-        config: &OverlayConfig,
-        sprite: &Sprite,
-        x: i32,
-        y: i32,
-    ) -> Result<()> {
+    fn draw(&mut self, ctx: &mut DrawContext<'_>, sprite: &Sprite, x: i32, y: i32) -> Result<()> {
         let scale_120 = self.scale_120;
-        let scale_factor = self.scale_factor();
         let size = self.size;
         // Destroying and rebuilding the surface both happen once, in `hide_outputs`.
         let Some(surface) = &mut self.surface else {
@@ -796,7 +913,7 @@ impl Screen {
         if self.hidden || !surface.configured || size.0 <= 0 || size.1 <= 0 {
             return Ok(());
         }
-        let logical = |pixels: u32| i32::try_from(pixels * config.scale).expect("sprite fits");
+        let logical = |pixels: u32| i32::try_from(pixels * ctx.config.scale).expect("sprite fits");
         let whole = Rect {
             x,
             y,
@@ -810,14 +927,14 @@ impl Screen {
             height: size.1,
         });
 
-        let mut changed = false;
+        let mut changed = surface.needs_commit;
         if surface.backdrop.is_none() {
-            surface.attach_backdrop(pool, size, scale_factor)?;
+            surface.attach_backdrop(ctx, size, scale_120)?;
             changed = true;
         }
         match visible {
             Some(visible) => {
-                changed |= surface.draw_sprite(pool, config, sprite, whole, visible, scale_120)?;
+                changed |= surface.draw_sprite(ctx, sprite, whole, visible, scale_120)?;
             }
             // With several monitors most of them have nothing to show on most
             // frames; committing anyway would wake the compositor for them
@@ -837,6 +954,7 @@ impl Screen {
         // only take effect with this commit, so they always move together.
         if changed {
             surface.layer.commit();
+            surface.needs_commit = false;
         }
         Ok(())
     }
@@ -855,6 +973,7 @@ struct State {
     screens: Vec<Screen>,
     viewporter: Option<OwnedViewporter>,
     fractional_scales: Option<OwnedFractionalScaleManager>,
+    single_pixel_buffer_manager: Option<OwnedSinglePixelBufferManager>,
     next_id: u32,
     /// Held so the compositor keeps sending idle events; never read.
     _idle_monitor: Option<IdleMonitor>,
@@ -874,14 +993,13 @@ impl State {
             .is_some_and(|name| &name == wanted)
     }
 
-    /// Where the compositor puts this output in the global layout, as
-    /// `xdg_output` reports it. An output without one is placed at the origin,
-    /// which is right for a single monitor and the best guess otherwise.
+    /// Where the compositor puts this output in the global layout, preferring
+    /// `xdg_output`'s `logical_position` and falling back to `wl_output`'s
+    /// `location`.
     fn position_of(&self, output: &wl_output::WlOutput) -> (i32, i32) {
-        self.outputs
-            .info(output)
-            .and_then(|info| info.logical_position)
-            .unwrap_or((0, 0))
+        self.outputs.info(output).map_or((0, 0), |info| {
+            info.logical_position.unwrap_or(info.location)
+        })
     }
 
     /// Builds a surface for an output, unless `--output` rules it out or it
@@ -896,11 +1014,16 @@ impl State {
 
         let surface = self.make_screen_surface(output, id);
 
-        let name = self
-            .outputs
-            .info(output)
-            .and_then(|info| info.name)
+        let info = self.outputs.info(output);
+        let name = info
+            .as_ref()
+            .and_then(|info| info.name.clone())
             .unwrap_or_else(|| "?".to_owned());
+        let scale_120 = effective_scale_120(
+            initial_scale_120(info.as_ref().map(|info| info.scale_factor)),
+            surface.viewport.is_some(),
+            surface.layer.wl_surface().version(),
+        );
         let position = self.position_of(output);
         log::info!(
             "covering output {name} at {},{} as screen {}",
@@ -914,7 +1037,7 @@ impl State {
             output: output.clone(),
             name,
             surface: Some(surface),
-            scale_120: SCALE_DENOMINATOR,
+            scale_120,
             position,
             size: (0, 0),
             hidden: false,
@@ -934,6 +1057,7 @@ impl State {
             layer,
             backdrop: None,
             configured: false,
+            needs_commit: false,
         }
     }
 
@@ -974,8 +1098,10 @@ impl State {
             Ok(region) => layer.set_input_region(Some(region.wl_region())),
             Err(error) => log::error!("no input region ({error}); the overlay will eat clicks"),
         }
-        layer.commit();
 
+        // Create viewport and fractional-scale objects before the initial
+        // commit so the compositor can report the preferred scale alongside
+        // the first configure instead of forcing an immediate redraw.
         let viewport = self.viewporter.as_ref().map(|viewporter| {
             OwnedViewport(viewporter.0.get_viewport(layer.wl_surface(), &self.qh, id))
         });
@@ -988,6 +1114,8 @@ impl State {
                 ))
             })
         });
+
+        layer.commit();
 
         (layer, viewport, fractional_scale)
     }
@@ -1024,22 +1152,37 @@ impl State {
         };
         let output = screen.output.clone();
         let surface = self.make_screen_surface(&output, id);
+        // Without `wp_fractional_scale_v1`, SCTK starts a new surface at
+        // scale 1 and only fires `scale_factor_changed` on a change, so if the
+        // output dropped from 2x to 1x while hidden we would stay stuck at 2x.
+        // `OutputState` keeps tracking output scale while hidden, so refresh
+        // from it here.
+        let fallback_scale = surface.fractional_scale.is_none().then(|| {
+            effective_scale_120(
+                initial_scale_120(self.outputs.info(&output).map(|info| info.scale_factor)),
+                surface.viewport.is_some(),
+                surface.layer.wl_surface().version(),
+            )
+        });
         let Some(screen) = self.screen_mut(id) else {
             return;
         };
         screen.surface = Some(surface);
-        screen.scale_120 = SCALE_DENOMINATOR;
-        screen.update_scaling();
+        if let Some(scale_120) = fallback_scale {
+            screen.scale_120 = scale_120;
+        }
     }
 
     fn screen_mut(&mut self, id: ScreenId) -> Option<&mut Screen> {
         self.screens.iter_mut().find(|screen| screen.id == id)
     }
 
-    fn any_configured(&self) -> bool {
-        self.screens
-            .iter()
-            .any(|screen| screen.surface.as_ref().is_some_and(|s| s.configured))
+    fn all_configured(&self) -> bool {
+        !self.screens.is_empty()
+            && self
+                .screens
+                .iter()
+                .all(|screen| screen.surface.as_ref().is_some_and(|s| s.configured))
     }
 
     /// A layout with a hole in it - two monitors of different heights, say -
@@ -1063,21 +1206,18 @@ impl State {
         // compositor's, which is where the outputs are placed.
         let (global_x, global_y) = (origin_x + x, origin_y + y);
 
-        // By index, so the pool can be borrowed alongside one screen at a time.
-        for index in 0..self.screens.len() {
-            let (position, id) = {
-                let screen = &self.screens[index];
-                (screen.position, screen.id)
-            };
-            let (local_x, local_y) = (global_x - position.0, global_y - position.1);
-            let Some(screen) = self.screens.get_mut(index) else {
-                continue;
-            };
+        let mut ctx = DrawContext {
+            pool: &mut self.pool,
+            single_pixel_buffer_manager: self.single_pixel_buffer_manager.as_ref(),
+            qh: &self.qh,
+            config: &self.config,
+        };
+        for screen in &mut self.screens {
+            let (local_x, local_y) = (global_x - screen.position.0, global_y - screen.position.1);
             // One screen failing - a buffer that could not be allocated, say -
             // is no reason to take the animal off the others.
-            if let Err(error) = screen.draw(&mut self.pool, &self.config, sprite, local_x, local_y)
-            {
-                log::warn!("drawing on screen {}: {error:#}", id.0);
+            if let Err(error) = screen.draw(&mut ctx, sprite, local_x, local_y) {
+                log::warn!("drawing on screen {}: {error:#}", screen.id.0);
             }
         }
     }
@@ -1093,6 +1233,8 @@ fn bind_idle_notification(
     qh: &QueueHandle<State>,
     after: std::time::Duration,
 ) -> Option<IdleMonitor> {
+    // Bind up to v2, but intentionally use `get_idle_notification` rather than
+    // v2's `get_input_idle_notification` so idle inhibitors are respected.
     let notifier: ExtIdleNotifierV1 = match globals.bind(qh, 1..=2, ()) {
         Ok(notifier) => notifier,
         Err(error) => {
@@ -1130,6 +1272,9 @@ impl Dispatch<WpFractionalScaleV1, ScreenId> for State {
         let wp_fractional_scale_v1::Event::PreferredScale { scale } = event else {
             return;
         };
+        if scale == 0 {
+            return;
+        }
         let Some(screen) = state.screen_mut(*id) else {
             return;
         };
@@ -1180,6 +1325,33 @@ impl Dispatch<WpFractionalScaleManagerV1, ()> for State {
         _qh: &QueueHandle<Self>,
     ) {
         // No events.
+    }
+}
+
+impl Dispatch<WpSinglePixelBufferManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpSinglePixelBufferManagerV1,
+        _event: wp_single_pixel_buffer_manager_v1::Event,
+        (): &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // No events.
+    }
+}
+
+impl Dispatch<wl_buffer::WlBuffer, SinglePixelBuffer> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_buffer::WlBuffer,
+        _event: wl_buffer::Event,
+        _data: &SinglePixelBuffer,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // Single-pixel buffers are immutable and never overwritten, so
+        // wl_buffer.release does not need handling.
     }
 }
 
@@ -1295,15 +1467,23 @@ impl LayerShellHandler for State {
         }) else {
             return;
         };
-        if size != screen.size {
+        let was_configured = screen.surface.as_ref().is_some_and(|s| s.configured);
+        let size_changed = size != screen.size;
+        if size_changed {
             log::info!("screen {} configured at {}x{}", screen.id.0, size.0, size.1);
             screen.size = size;
-            // The old buffers are the wrong size now.
-            screen.invalidate_buffers();
+            if let Some(surface) = &mut screen.surface
+                && surface.viewport.is_none()
+            {
+                surface.backdrop = None;
+            }
+        }
+        if !was_configured || size_changed {
             screen.update_scaling();
         }
         if let Some(surface) = &mut screen.surface {
             surface.configured = true;
+            surface.needs_commit = true;
         }
     }
 }
@@ -1399,19 +1579,27 @@ impl OutputHandler for State {
         self.add_screen(&output);
 
         let position = self.position_of(&output);
+        let name = self.outputs.info(&output).and_then(|info| info.name);
         if let Some(screen) = self
             .screens
             .iter_mut()
             .find(|screen| screen.output == output)
-            && screen.position != position
         {
-            log::info!(
-                "screen {} moved to {},{}",
-                screen.id.0,
-                position.0,
-                position.1
-            );
-            screen.position = position;
+            if let Some(name) = name
+                && screen.name != name
+            {
+                log::info!("screen {} is now named {name}", screen.id.0);
+                screen.name = name;
+            }
+            if screen.position != position {
+                log::info!(
+                    "screen {} moved to {},{}",
+                    screen.id.0,
+                    position.0,
+                    position.1
+                );
+                screen.position = position;
+            }
         }
     }
 
@@ -1448,8 +1636,8 @@ delegate_registry!(State);
 #[cfg(test)]
 mod tests {
     use super::{
-        DrawnFrame, FrameCache, Rect, SCALE_DENOMINATOR, layout_bounds, point_on_hidden_screen,
-        sprite_geometry,
+        DrawnFrame, FrameCache, Rect, SCALE_DENOMINATOR, effective_scale_120, initial_scale_120,
+        layout_bounds, point_on_hidden_screen, sprite_geometry,
     };
 
     #[test]
@@ -1670,5 +1858,25 @@ mod tests {
         // Points on the visible neighbour are not hidden.
         assert!(!point_on_hidden_screen(screens, 0, 0));
         assert!(!point_on_hidden_screen(screens, 1280, 720));
+    }
+
+    #[test]
+    fn effective_scale_falls_back_to_unity_without_viewport_or_buffer_scale() {
+        assert_eq!(effective_scale_120(240, false, 1), SCALE_DENOMINATOR);
+        assert_eq!(effective_scale_120(240, false, 2), SCALE_DENOMINATOR);
+        assert_eq!(effective_scale_120(240, false, 3), 240);
+        assert_eq!(effective_scale_120(240, false, 6), 240);
+        // With a viewport, scaling is handled via set_destination regardless of surface version.
+        assert_eq!(effective_scale_120(180, true, 1), 180);
+        assert_eq!(effective_scale_120(240, true, 2), 240);
+    }
+
+    #[test]
+    fn initial_scale_uses_output_factor_with_safe_floor() {
+        assert_eq!(initial_scale_120(Some(2)), 2 * SCALE_DENOMINATOR);
+        assert_eq!(initial_scale_120(Some(1)), SCALE_DENOMINATOR);
+        assert_eq!(initial_scale_120(Some(0)), SCALE_DENOMINATOR);
+        assert_eq!(initial_scale_120(Some(-3)), SCALE_DENOMINATOR);
+        assert_eq!(initial_scale_120(None), SCALE_DENOMINATOR);
     }
 }
