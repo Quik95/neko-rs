@@ -160,6 +160,7 @@ fn run(args: &Cli) -> Result<()> {
             .with_context(|| format!("no sprite named {frame}"))?;
         let (x, y) = neko.position();
         overlay.draw(sprite, x, y);
+        overlay.flush()?;
 
         // oneko thinks eight times a second; keep that rate regardless of how
         // long the frame took.

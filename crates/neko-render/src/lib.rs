@@ -20,6 +20,8 @@
 //! edge is drawn on both surfaces, each clipping its own half, so the animal
 //! walks from screen to screen instead of stopping at the seam.
 
+use std::io;
+
 use anyhow::{Context as _, Result, bail};
 use neko_sprites::{Canvas, Palette, Sprite};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
@@ -34,6 +36,7 @@ use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::subcompositor::SubcompositorState;
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
+use wayland_client::backend::WaylandError;
 use wayland_client::globals::{GlobalList, registry_queue_init};
 use wayland_client::protocol::{
     wl_output, wl_seat, wl_shm, wl_subsurface::WlSubsurface, wl_surface,
@@ -288,12 +291,35 @@ impl Overlay {
         self.state.screens.len()
     }
 
-    /// Handles pending Wayland events - configures, output changes, closes.
+    /// Handles pending Wayland events without blocking - configures, output
+    /// changes, closes.
     pub fn dispatch(&mut self) -> Result<()> {
         self.event_queue
-            .roundtrip(&mut self.state)
-            .context("Wayland roundtrip")?;
+            .dispatch_pending(&mut self.state)
+            .context("Wayland dispatch")?;
+        if let Some(guard) = self.event_queue.prepare_read() {
+            match guard.read() {
+                Ok(_) => {}
+                Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error).context("Wayland read"),
+            }
+        }
+        self.event_queue
+            .dispatch_pending(&mut self.state)
+            .context("Wayland dispatch")?;
         Ok(())
+    }
+
+    /// Sends any queued Wayland requests to the compositor without waiting for a reply.
+    pub fn flush(&mut self) -> Result<()> {
+        match self.event_queue.flush() {
+            Ok(()) => Ok(()),
+            Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                log::debug!("Wayland socket buffer full, deferring flush");
+                Ok(())
+            }
+            Err(error) => Err(error).context("Wayland flush"),
+        }
     }
 
     /// Draws `sprite` with its top-left at `(x, y)`, in logical pixels relative
@@ -379,6 +405,82 @@ struct Screen {
     hidden: bool,
 }
 
+/// The last frame committed to a screen's sprite subsurface, used to skip
+/// redrawing and committing when nothing has changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DrawnFrame {
+    sprite: &'static str,
+    whole: Rect,
+    visible: Rect,
+}
+
+/// Tracks what is currently committed on a screen's sprite subsurface so
+/// unchanged frames can skip redrawing and committing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FrameCache {
+    /// Whether a buffer is attached, i.e. the animal is on this output.
+    shown: bool,
+    last: Option<DrawnFrame>,
+}
+
+impl FrameCache {
+    fn is_current(&self, frame: DrawnFrame) -> bool {
+        self.shown && self.last == Some(frame)
+    }
+
+    fn record(&mut self, frame: DrawnFrame) {
+        self.shown = true;
+        self.last = Some(frame);
+    }
+
+    fn clear_shown(&mut self) {
+        self.shown = false;
+        self.last = None;
+    }
+
+    fn invalidate(&mut self) {
+        self.last = None;
+    }
+}
+
+/// Device-pixel dimensions and blit parameters for a sprite buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpriteGeometry {
+    width: i32,
+    height: i32,
+    dst_x: i32,
+    dst_y: i32,
+    stretch: (u32, u32),
+}
+
+/// Converts a logical pixel length or offset to device pixels at `scale_120`.
+fn device_pixels(logical: i32, scale_120: u32) -> i32 {
+    let scale = f64::from(scale_120) / f64::from(SCALE_DENOMINATOR);
+    round(f64::from(logical) * scale)
+}
+
+/// Computes the sprite buffer size, stretch target, and blit offset in device
+/// pixels directly from rectangle dimensions rather than rounded edges, so the
+/// buffer size stays constant as the sprite moves under a fractional scale.
+fn sprite_geometry(whole: Rect, visible: Rect, scale_120: u32) -> SpriteGeometry {
+    let device = |logical: i32| device_pixels(logical, scale_120);
+    let width = device(visible.width).max(1);
+    let height = device(visible.height).max(1);
+    let stretch = (
+        u32::try_from(device(whole.width).max(1)).expect("positive width"),
+        u32::try_from(device(whole.height).max(1)).expect("positive height"),
+    );
+    let dst_x = device(whole.x - visible.x);
+    let dst_y = device(whole.y - visible.y);
+    SpriteGeometry {
+        width,
+        height,
+        dst_x,
+        dst_y,
+        stretch,
+    }
+}
+
 /// The subsurface the animal is drawn on, sized to the part of it that lies on
 /// this output.
 struct SpriteSurface {
@@ -391,8 +493,7 @@ struct SpriteSurface {
     /// the last two it was given, so drawing never waits on a release: another
     /// small buffer is allocated instead.
     buffers: Vec<Buffer>,
-    /// Whether a buffer is attached, i.e. the animal is on this output.
-    shown: bool,
+    cache: FrameCache,
 }
 
 impl SpriteSurface {
@@ -461,6 +562,7 @@ impl Screen {
     fn invalidate_buffers(&mut self) {
         self.backdrop = None;
         self.sprite.buffers.clear();
+        self.sprite.cache.invalidate();
     }
 
     /// The scale to draw at as a plain number.
@@ -474,11 +576,6 @@ impl Screen {
         i32::try_from(self.scale_120 / SCALE_DENOMINATOR)
             .unwrap_or(1)
             .max(1)
-    }
-
-    /// A logical coordinate in device pixels.
-    fn device(&self, logical: i32) -> i32 {
-        round(f64::from(logical) * self.scale_factor())
     }
 
     /// Adopts a new scale, in 120ths, from whichever protocol reported it.
@@ -559,6 +656,7 @@ impl Screen {
         surface.attach(None, 0, 0);
         surface.commit();
         self.backdrop = None;
+        self.sprite.cache.clear_shown();
         // An unmapped layer surface is back where it started: attaching a
         // buffer before the compositor has configured it again is a protocol
         // error that kills the connection, so it counts as unconfigured until
@@ -607,13 +705,15 @@ impl Screen {
             // With several monitors most of them have nothing to show on most
             // frames; committing anyway would wake the compositor for them
             // eight times a second to change nothing.
-            None if self.sprite.shown => {
+            None if self.sprite.cache.shown => {
                 self.sprite.surface.attach(None, 0, 0);
                 self.sprite.surface.commit();
-                self.sprite.shown = false;
+                self.sprite.cache.clear_shown();
                 changed = true;
             }
-            None => {}
+            None => {
+                self.sprite.cache.invalidate();
+            }
         }
         // The sprite is a synchronised subsurface: its buffer and position
         // only take effect with this commit, so they always move together.
@@ -634,15 +734,20 @@ impl Screen {
         whole: Rect,
         visible: Rect,
     ) -> Result<bool> {
-        // Everything below works in device pixels, taken from where the
-        // compositor will put the edges, so the buffer lands on whole pixels
-        // unscaled and the 1-bit art stays sharp. The price under a fractional
-        // scale is that some of its pixels are one device pixel wider than
-        // their neighbours.
-        let (left, top) = (self.device(visible.x), self.device(visible.y));
-        let width = (self.device(visible.x + visible.width) - left).max(1);
-        let height = (self.device(visible.y + visible.height) - top).max(1);
-        let Some(buffer) = self.sprite.take_buffer(pool, width, height)? else {
+        let frame = DrawnFrame {
+            sprite: sprite.name,
+            whole,
+            visible,
+        };
+        if self.sprite.cache.is_current(frame) {
+            return Ok(false);
+        }
+
+        // Size the buffer directly from the rectangle dimensions rather than
+        // rounded screen edges so moving under a fractional scale does not
+        // jitter the buffer size by ±1 device pixel and thrash allocations.
+        let geom = sprite_geometry(whole, visible, self.scale_120);
+        let Some(buffer) = self.sprite.take_buffer(pool, geom.width, geom.height)? else {
             log::debug!("every sprite buffer still in use, skipping a frame");
             return Ok(false);
         };
@@ -650,18 +755,12 @@ impl Screen {
         canvas.fill(0);
         // The pool hands out bytes; the format is Argb8888, so they are pixels.
         let pixels: &mut [u32] = bytemuck::cast_slice_mut(canvas);
-        let stride = usize::try_from(width).expect("positive width");
-        let stretch = (
-            u32::try_from((self.device(whole.x + whole.width) - self.device(whole.x)).max(1))
-                .expect("positive width"),
-            u32::try_from((self.device(whole.y + whole.height) - self.device(whole.y)).max(1))
-                .expect("positive height"),
-        );
+        let stride = usize::try_from(geom.width).expect("positive width");
         sprite.blit_argb(
             &mut Canvas { pixels, stride },
-            self.device(whole.x) - left,
-            self.device(whole.y) - top,
-            stretch,
+            geom.dst_x,
+            geom.dst_y,
+            geom.stretch,
             config.palette,
         );
 
@@ -669,7 +768,7 @@ impl Screen {
         buffer
             .attach_to(surface)
             .context("attach the sprite buffer")?;
-        surface.damage_buffer(0, 0, width, height);
+        surface.damage_buffer(0, 0, geom.width, geom.height);
         if let Some(viewport) = &self.sprite.viewport {
             viewport.set_destination(visible.width, visible.height);
         } else if surface.version() >= 3 {
@@ -678,7 +777,7 @@ impl Screen {
         self.sprite.subsurface.set_position(visible.x, visible.y);
         surface.commit();
         self.sprite.buffers.push(buffer);
-        self.sprite.shown = true;
+        self.sprite.cache.record(frame);
         Ok(true)
     }
 }
@@ -841,7 +940,7 @@ impl State {
             subsurface,
             viewport,
             buffers: Vec::new(),
-            shown: false,
+            cache: FrameCache::default(),
         }
     }
 
@@ -1262,7 +1361,7 @@ delegate_registry!(State);
 
 #[cfg(test)]
 mod tests {
-    use super::{Rect, layout_bounds};
+    use super::{DrawnFrame, FrameCache, Rect, SCALE_DENOMINATOR, layout_bounds, sprite_geometry};
 
     #[test]
     fn layout_retains_geometry_without_surface_configuration() {
@@ -1320,5 +1419,134 @@ mod tests {
             ..straddling
         };
         assert_eq!(touching.intersect(screen), None);
+    }
+
+    #[test]
+    fn fractional_scale_buffer_size_is_invariant_under_translation() {
+        // 133.3% (160/120), 125% (150/120), 140% (168/120), 160% (192/120).
+        for scale_120 in [160, 150, 168, 192] {
+            let origin = Rect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 32,
+            };
+            let baseline = sprite_geometry(origin, origin, scale_120);
+            for offset in 1..=64 {
+                let moved = Rect {
+                    x: offset,
+                    y: offset * 3,
+                    width: 32,
+                    height: 32,
+                };
+                let geom = sprite_geometry(moved, moved, scale_120);
+                assert_eq!(geom, baseline, "scale_120={scale_120}, offset={offset}");
+                assert_eq!((geom.dst_x, geom.dst_y), (0, 0));
+            }
+
+            // Partially clipped on the left/top edge shifts the blit offset
+            // negatively while keeping stretch constant.
+            let whole = Rect {
+                x: -10,
+                y: -6,
+                width: 32,
+                height: 32,
+            };
+            let visible = Rect {
+                x: 0,
+                y: 0,
+                width: 22,
+                height: 26,
+            };
+            let clipped = sprite_geometry(whole, visible, scale_120);
+            assert_eq!(clipped.stretch, baseline.stretch);
+            assert!(clipped.dst_x < 0 && clipped.dst_y < 0);
+            assert!(clipped.width > 0 && clipped.height > 0);
+        }
+    }
+
+    #[test]
+    fn integer_scale_buffer_dimensions_are_multiples_of_buffer_scale() {
+        for buffer_scale in 1..=4 {
+            let scale_120 = u32::try_from(buffer_scale).unwrap() * SCALE_DENOMINATOR;
+            for &(w, h) in &[(1, 1), (13, 27), (32, 32), (64, 64), (19, 3)] {
+                let whole = Rect {
+                    x: -5,
+                    y: 7,
+                    width: 64,
+                    height: 64,
+                };
+                let visible = Rect {
+                    x: 0,
+                    y: 7,
+                    width: w,
+                    height: h,
+                };
+                let geom = sprite_geometry(whole, visible, scale_120);
+                assert_eq!(geom.width, w * buffer_scale);
+                assert_eq!(geom.height, h * buffer_scale);
+                assert_eq!(geom.width % buffer_scale, 0);
+                assert_eq!(geom.height % buffer_scale, 0);
+                assert_eq!(geom.dst_x, -5 * buffer_scale);
+                assert_eq!(geom.dst_y, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn frame_cache_skips_unchanged_frames_and_honours_invalidation() {
+        let mut cache = FrameCache::default();
+        let rect = Rect {
+            x: 100,
+            y: 200,
+            width: 32,
+            height: 32,
+        };
+        let sleep1 = DrawnFrame {
+            sprite: "sleep1",
+            whole: rect,
+            visible: rect,
+        };
+        let sleep2 = DrawnFrame {
+            sprite: "sleep2",
+            ..sleep1
+        };
+        let moved = DrawnFrame {
+            whole: Rect { x: 104, ..rect },
+            visible: Rect { x: 104, ..rect },
+            ..sleep1
+        };
+
+        // Nothing drawn yet.
+        assert!(!cache.is_current(sleep1));
+
+        // After committing, the same frame is skipped.
+        cache.record(sleep1);
+        assert!(cache.shown);
+        assert!(cache.is_current(sleep1));
+
+        // Different sprite or position requires a redraw.
+        assert!(!cache.is_current(sleep2));
+        assert!(!cache.is_current(moved));
+
+        // If a frame is skipped due to no free buffer, `record` is not called,
+        // so the new frame remains dirty on the next tick.
+        assert!(!cache.is_current(sleep2));
+
+        // Scale or size change invalidates the cached frame while keeping
+        // `shown` true so leaving the screen still detaches the old buffer.
+        cache.invalidate();
+        assert!(cache.shown);
+        assert!(!cache.is_current(sleep1));
+
+        // Redrawing at the new scale/size caches the frame again.
+        cache.record(sleep1);
+        assert!(cache.is_current(sleep1));
+
+        // Leaving the screen or unmapping clears both `shown` and the cache;
+        // returning to the exact same spot and sprite forces a redraw.
+        cache.clear_shown();
+        assert!(!cache.shown);
+        assert!(!cache.is_current(sleep1));
     }
 }
